@@ -5,8 +5,11 @@ across repo boundaries. **Start here** if you need the design.
 
 - **Licence:** Apache-2.0
 - **Main branch:** `main`
-- **Status:** M1 (Foundations) complete. Eight repos, licence files, CI, HAL
-  traits, IDL skeleton.
+- **Status:** M1 complete. W2 (codec), W3 (VM), W4 (compiler), W10 (CLI) and the
+  W14 crypto seam are implemented in `lumen-core`; the codec conformance suite is
+  in `lumen-spec`; the stdlib and example corpus are in `lumen-effects`. The mesh
+  state machines (W5/W6/W7) are the next unblocked work and nothing downstream of
+  them exists yet.
 
 ## Layout — siblings, not submodules
 

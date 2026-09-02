@@ -38,6 +38,7 @@ name = "lumen-sim"
 version = "0.1.0"
 dependencies = [
  "lumen-device",
+ "lumen-hal",
 ]
 
 [[package]]
