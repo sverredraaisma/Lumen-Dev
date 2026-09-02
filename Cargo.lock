@@ -17,6 +17,9 @@ dependencies = [
 [[package]]
 name = "lumen-device"
 version = "0.1.0"
+dependencies = [
+ "lumen-proto",
+]
 
 [[package]]
 name = "lumen-hal"
