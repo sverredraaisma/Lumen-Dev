@@ -1,0 +1,16 @@
+[package]
+name = "canary"
+description = "Builds every sibling crate together; fails when a cross-repo change breaks a dependent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+lumen-proto = { workspace = true }
+lumen-vm = { workspace = true }
+lumen-lang = { workspace = true }
+lumen-hal = { workspace = true }
+lumen-device = { workspace = true }
+lumen-sim = { workspace = true }

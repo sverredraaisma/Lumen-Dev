@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = ["crates/canary"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.85"
+
+# Sibling checkouts, by path. `scripts/clone-all.sh` puts them where these
+# expect to find them.
+[workspace.dependencies]
+lumen-proto  = { path = "../lumen-core/crates/lumen-proto" }
+lumen-vm     = { path = "../lumen-core/crates/lumen-vm" }
+lumen-lang   = { path = "../lumen-core/crates/lumen-lang" }
+lumen-hal    = { path = "../lumen-core/crates/lumen-hal" }
+lumen-device = { path = "../lumen-device/crates/lumen-device" }
+lumen-sim    = { path = "../lumen-device/crates/lumen-sim" }
+
+# Once the dependent repos depend on published versions rather than nothing,
+# add the matching [patch.crates-io] block here so a checkout of this meta-repo
+# builds every sibling against the working tree instead of against crates.io:
+#
+# [patch.crates-io]
+# lumen-proto = { path = "../lumen-core/crates/lumen-proto" }
+# ...
