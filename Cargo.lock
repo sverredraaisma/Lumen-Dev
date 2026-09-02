@@ -19,6 +19,7 @@ name = "lumen-device"
 version = "0.1.0"
 dependencies = [
  "lumen-proto",
+ "lumen-vm",
 ]
 
 [[package]]

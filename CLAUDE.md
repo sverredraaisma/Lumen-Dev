@@ -5,11 +5,12 @@ across repo boundaries. **Start here** if you need the design.
 
 - **Licence:** Apache-2.0
 - **Main branch:** `main`
-- **Status:** M1 complete. W2 (codec), W3 (VM), W4 (compiler), W10 (CLI) and the
-  W14 crypto seam are implemented in `lumen-core`; the codec conformance suite is
-  in `lumen-spec`; the stdlib and example corpus are in `lumen-effects`. The mesh
-  state machines (W5/W6/W7) are the next unblocked work and nothing downstream of
-  them exists yet.
+- **Status:** M1 complete. Implemented: W2 codec, W3 VM, W4 compiler, W10 CLI and
+  the W14 crypto seam in `lumen-core`; W5 sync and election, W6 source stack,
+  zones, projections and render loop, W7 records and replication, W13 channels
+  and W16 gateway policy in `lumen-device`; W8 simulator; W11 preview daemon;
+  W15 stdlib and example corpus; the codec conformance suite in `lumen-spec`.
+  Blocked on hardware: the three spikes, W9 firmware, W12/W18 Android and AR.
 
 ## Layout — siblings, not submodules
 
