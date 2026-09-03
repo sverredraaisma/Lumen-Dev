@@ -1,7 +1,13 @@
-lumen-spec
-lumen-core
-lumen-device
-lumen-firmware
-lumen-desktop
-lumen-android
-lumen-effects
+# Local directory name, then the GitHub repository name.
+#
+# They differ in case, and the difference matters in one direction only: the
+# path dependencies in every sibling manifest resolve `../lumen-core`, so the
+# LOCAL name is load-bearing and must stay exactly as written here. The remote
+# name is whatever the repository is called on GitHub.
+lumen-spec      Lumen-Spec
+lumen-core      Lumen-Core
+lumen-device    Lumen-Device
+lumen-firmware  Lumen-Firmware
+lumen-desktop   Lumen-Desktop
+lumen-android   Lumen-Android
+lumen-effects   Lumen-Effects

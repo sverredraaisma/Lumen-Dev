@@ -9,7 +9,16 @@ here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
 status=0
 
-for repo in $(cat "$here/repos.txt") lumen-dev; do
+# First column only: repos.txt maps a local directory name to a remote
+# repository name, and it is the local one that exists on disk.
+repos=()
+while read -r local _remote; do
+  case "$local" in ''|\#*) continue ;; esac
+  repos+=("$local")
+done < "$here/repos.txt"
+repos+=(lumen-dev)
+
+for repo in "${repos[@]}"; do
   [ -d "$root/$repo" ] || continue
   echo "== $repo"
   ( cd "$root/$repo" && "$@" ) || status=1

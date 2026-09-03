@@ -28,7 +28,8 @@ lumen/
 ```
 
 ```
-scripts/clone-all.sh git@github.com:YOURORG   # clone or fast-forward all siblings
+scripts/clone-all.sh                           # clone or fast-forward all siblings
+scripts/clone-all.sh git@github.com:sverredraaisma   # ... over SSH instead
 scripts/foreach.sh git status --short          # run a command in each
 scripts/foreach.sh cargo test --workspace      # test everything
 cargo test                                     # build all siblings together (canary)

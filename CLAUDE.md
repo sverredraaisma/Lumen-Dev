@@ -36,7 +36,7 @@ spec repo goes first.
 cargo test                                     # canary: builds all siblings together
 scripts/foreach.sh git status --short          # run anything in every repo
 scripts/foreach.sh cargo test --workspace      # test everything
-scripts/clone-all.sh <git-remote-prefix>       # clone or fast-forward siblings
+scripts/clone-all.sh                           # clone or fast-forward siblings
 ```
 
 ## Dependency direction — strictly acyclic
