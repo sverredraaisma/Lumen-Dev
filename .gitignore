@@ -9,3 +9,7 @@ Cargo.lock.orig
 # Coverage output. `cargo llvm-cov --lcov` drops this in the repo root;
 # CI uploads it as an artifact and it is never a source file.
 lcov.info
+
+# Spike build output. The spikes sit outside the workspace and each has its
+# own target directory.
+spikes/*/target

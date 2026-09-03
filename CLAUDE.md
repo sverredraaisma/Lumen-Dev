@@ -93,11 +93,24 @@ Per-repo notes live in that repo's `docs/` and its own `CLAUDE.md`.
 
 Three assumptions carry the architecture, and all three need real hardware:
 
-| # | Spike | Passes if |
-|---|---|---|
-| S1 | Time sync across 3 ESP32s on ordinary WiFi, 24 h | 95th percentile offset under ±500 µs, no drift |
-| S2 | Bytecode interpreter in Rust, per-pixel, 300 LEDs | 60 fps with ≥1000 instructions/pixel headroom on an S3 |
-| S3 | Multicast CHAN at 60 Hz to 10+ devices on a consumer AP | Loss under 1%, jitter under a frame |
+| # | Spike | Passes if | Result |
+|---|---|---|---|
+| S1 | Time sync across 3 ESP32s on ordinary WiFi, 24 h | 95th percentile offset under ±500 µs, no drift | not run |
+| S2 | Bytecode interpreter in Rust, per-pixel, 300 LEDs | 60 fps with ≥1000 instructions/pixel headroom on an S3 | **conditional pass** |
+| S3 | Multicast CHAN at 60 Hz to 10+ devices on a consumer AP | Loss under 1%, jitter under a frame | not run |
+
+**S2 ran on a C3 and passed on the thing that mattered, not on its own
+criterion.** Every corpus effect renders 300 pixels inside a 60 fps frame, the
+worst at 86% — but the criterion asked for ≥1000 instructions/pixel of headroom
+and a C3 has about 60. That number was written before anything was measured. The
+comfortable envelope is 300 LEDs at 30 fps or 150 at 60.
+
+Two things came out of it that changed the code. The interpreter is
+**dispatch-bound** — 837 ns of every instruction is dispatch, 134 cycles, about
+80% of an average one. And the cost model was wrong: it mis-ranked real effects
+by up to 3.8×, so `OpCode::cost()` has been rewritten from measurement and one
+budget unit is now **100 ns on a C3**. Full findings in
+`spikes/s2-vm-throughput/RESULTS.md`.
 
 A few hundred lines each, and far cheaper than discovering the problem later.
 

@@ -115,7 +115,9 @@ The through-line: **each of these is simultaneously documentation and testing**.
 
 ## Build order
 
-Nothing is built yet, so the first job is not writing the system — it is **falsifying the three assumptions the architecture rests on**. Each spike below has a number attached. If a spike fails, the design above needs revisiting, and it is far cheaper to learn that now.
+The first job is not writing the system — it is **falsifying the three assumptions the architecture rests on**. Each spike below has a number attached. If a spike fails, the design above needs revisiting, and it is far cheaper to learn that now.
+
+M1 has since been built out ahead of S1 and S3, which needed hardware that was not available. S2 has now run.
 
 ### Spikes — do these first, on real hardware
 
@@ -123,6 +125,8 @@ Nothing is built yet, so the first job is not writing the system — it is **fal
 |---|---|---|---|
 | S1 | Time sync across 3 ESP32s on ordinary WiFi, left running 24 h | 95th percentile offset under **±500 µs**, no drift over the session | Rendering must move towards streamed frames, or shows accept visible looseness |
 | S2 | Hand-written bytecode interpreter **in Rust**, per-pixel kernel, 300 LEDs | **60 fps with ≥1000 instructions/pixel** of headroom on an S3 | Reduce ambition to fixed primitives, or accept 30 fps, or drop weaker chips |
+
+**S2 has run, on a C3 rather than an S3, and landed on its own third fallback.** Every corpus effect renders 300 pixels inside a 60 fps frame — the worst at 86% of it — so the architecture holds. But the ~1000 instructions/pixel in the criterion was written before measurement and the real figure is about 60, so the honest envelope is **300 LEDs at 30 fps, or 150 at 60**, which is the "accept 30 fps" column. The interpreter turns out to be dispatch-bound (837 ns per instruction, 80% of it dispatch), and the cost model it shipped with mis-ranked effects by 3.8× and has been rewritten from measurement. Findings: `spikes/s2-vm-throughput/RESULTS.md`.
 | S3 | Multicast CHAN at 60 Hz to 10+ devices on a consumer AP | Loss under 1%, jitter under a frame | The channel design needs a unicast fallback before anything is built on it |
 
 S1 and S2 together are the architecture. S3 decides how much of the network design needs a plan B. None of them need a compiler, an app, or a protocol — a few hundred lines each.

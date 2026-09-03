@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
 members = ["crates/canary"]
+# The hardware spikes are excluded from the canary workspace. The spike itself
+# cross-compiles to a device target and cannot run here; its generator is a host
+# crate, but building it as a member would drag `lumen-vm` into the canary's
+# feature unification for no benefit.
+exclude = ["spikes/s2-vm-throughput", "spikes/s2-vm-throughput-gen"]
 
 [workspace.package]
 version = "0.1.0"

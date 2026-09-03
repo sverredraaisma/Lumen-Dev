@@ -1,0 +1,26 @@
+[package]
+name = "s2-vm-throughput"
+description = "Spike S2: does the bytecode VM hit 60 fps for 300 pixels on real hardware?"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "s2-vm-throughput"
+path = "src/main.rs"
+
+[dependencies]
+esp-hal = { version = "0.23", features = ["esp32c3"] }
+esp-println = { version = "0.13", default-features = false, features = ["esp32c3", "jtag-serial"] }
+esp-backtrace = { version = "0.15", features = ["esp32c3", "println", "panic-handler"] }
+
+# The real interpreter, not a copy of it. `default-features = false` turns off
+# the program builder, which needs an allocator this target does not have — the
+# same thing a firmware build does.
+lumen-vm = { path = "../../../lumen-core/crates/lumen-vm", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = 2

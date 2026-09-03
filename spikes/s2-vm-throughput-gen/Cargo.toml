@@ -1,0 +1,17 @@
+# Generator for the spike's measurement programs.
+#
+# A separate crate from the spike itself, and a sibling directory rather than a
+# child: the spike is `no_std` and its `.cargo/config.toml` pins the RISC-V
+# target, which any crate underneath would silently inherit. This one runs on
+# the host.
+#
+# Kept rather than thrown away so the `.lvmb` files checked in next door can be
+# regenerated and the measurement repeated.
+[package]
+name = "s2-gen"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+lumen-vm = { path = "../../../lumen-core/crates/lumen-vm" }
