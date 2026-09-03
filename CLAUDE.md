@@ -95,7 +95,7 @@ Three assumptions carry the architecture, and all three need real hardware:
 
 | # | Spike | Passes if | Result |
 |---|---|---|---|
-| S1 | Time sync across 3 ESP32s on ordinary WiFi, 24 h | 95th percentile offset under ±500 µs, no drift | not run |
+| S1 | Time sync across 3 ESP32s on ordinary WiFi, 24 h | 95th percentile offset under ±500 µs, no drift | **fails the number, meets the requirement** |
 | S2 | Bytecode interpreter in Rust, per-pixel, 300 LEDs | 60 fps with ≥1000 instructions/pixel headroom on an S3 | **conditional pass** |
 | S3 | Multicast CHAN at 60 Hz to 10+ devices on a consumer AP | Loss under 1%, jitter under a frame | not run |
 
@@ -105,7 +105,16 @@ worst at 86% — but the criterion asked for ≥1000 instructions/pixel of headr
 and a C3 has about 60. That number was written before anything was measured. The
 comfortable envelope is 300 LEDs at 30 fps or 150 at 60.
 
-Two things came out of it that changed the code. The interpreter is
+**S1 ran on two boards over a domestic AP.** It misses ±500 µs at p95 — the best
+the specified algorithm managed was p50 225 µs, p95 675 µs — but that is 4% of a
+16.7 ms frame, and "does not visibly tear" is the requirement the ±500 µs was
+standing in for. Two changes came out of it, both now in the spec: **power save
+must be off** (worth 4× on its own) and **the burst is 32 samples, not 8** (worth
+better than 2×). Longer is not monotonically better — at 128 the crystal's
+33 µs/s drift accumulates inside the window faster than the noise averages out.
+Full findings in `spikes/s1-time-sync/RESULTS.md`.
+
+Two things came out of S2 that changed the code. The interpreter is
 **dispatch-bound** — 837 ns of every instruction is dispatch, 134 cycles, about
 80% of an average one. And the cost model was wrong: it mis-ranked real effects
 by up to 3.8×, so `OpCode::cost()` has been rewritten from measurement and one
