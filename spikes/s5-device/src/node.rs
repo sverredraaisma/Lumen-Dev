@@ -151,6 +151,11 @@ impl Node {
             // 1.2 A, so this strip *will* derate - which is the point: a board
             // that browns out mid-frame looks exactly like a driver that cannot
             // hold one.
+            //
+            // No dithering. It was tried and it looks like a fault: at 30 fps a
+            // pixel sitting near half a code toggles at about 15 Hz, which is
+            // close to the worst frequency there is for human vision. A fade
+            // that ends slightly early is the better trade on a bare strip.
             output: Output::new().with_power(PowerModel::ws2812(500)),
         }
     }
