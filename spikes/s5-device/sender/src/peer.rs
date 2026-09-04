@@ -132,6 +132,10 @@ pub fn run(capacity: u32, port: u16, play: Option<Vec<u8>>, leds: u16) -> std::i
     let mut last_report = Instant::now();
     let mut seen_ticks = 0u32;
     let (mut skew_samples, mut skew_total, mut worst_skew_us) = (0u64, 0i64, 0i64);
+    let mut differ = 0u64;
+    let (mut agree_w, mut differ_w) = (0u64, 0u64);
+    let mut worst_stale_us = 0i64;
+    let (mut frame_samples, mut frame_drift_total, mut frame_drift_worst) = (0u64, 0i64, 0i64);
 
     println!(
         "peer up: capacity {capacity}, uuid {:02x}{:02x}{:02x}{:02x}…, port {port}",
@@ -220,6 +224,55 @@ pub fn run(capacity: u32, port: u16, play: Option<Vec<u8>>, leds: u16) -> std::i
                         }
                     }
                 }
+                // A device announcing what it drew. Render the same frame index
+                // and compare: matching fingerprints mean the two nodes produced
+                // the same picture, and the index difference says whether they
+                // produced it at the same moment. Neither question can be
+                // answered from two logs taken at different instants.
+                if n >= 26 && buf[0] == 0xA5 && buf[1] == 1 {
+                    if let Some(l) = live.as_mut() {
+                        let theirs_index = u64::from_le_bytes(
+                            buf[2..10].try_into().expect("eight bytes"),
+                        );
+                        let theirs_digest = u64::from_le_bytes(
+                            buf[10..18].try_into().expect("eight bytes"),
+                        );
+                        // Their clock when they sent, so staleness and
+                        // disagreement can be separated.
+                        let theirs_now = u64::from_le_bytes(
+                            buf[18..26].try_into().expect("eight bytes"),
+                        );
+                        if theirs_index > 0 {
+                            let mine = l.frame(theirs_index * FRAME_US);
+                            let same_picture = mine == theirs_digest;
+                            // How far apart the two clocks put the same moment,
+                            // in frames - which is the question M2 asks. The
+                            // report's own age is excluded: that is this node's
+                            // and the network's latency, not the mesh's.
+                            let drift =
+                                theirs_now as i64 / FRAME_US as i64 - theirs_index as i64;
+                            let stale = now as i64 - theirs_now as i64;
+                            if stale.abs() > worst_stale_us {
+                                worst_stale_us = stale.abs();
+                            }
+                            if same_picture {
+                                agree_w += 1;
+                            } else {
+                                differ += 1;
+                                differ_w += 1;
+                            }
+                            frame_drift_total += drift;
+                            frame_drift_worst = frame_drift_worst.max(drift.abs());
+                            frame_samples += 1;
+                            if !same_picture && differ <= 3 {
+                                println!(
+                                    "  frame #{theirs_index}: device {theirs_digest:016x}, peer {mine:016x} - DIFFERENT"
+                                );
+                            }
+                        }
+                    }
+                }
+
                 // A device announcing that it holds nothing gets the effect.
                 if n >= 2 && buf[0] == 0xA5 && buf[1] == 0 {
                     if let (Some(code), SocketAddr::V4(v4)) = (&play, from) {
@@ -273,6 +326,22 @@ pub fn run(capacity: u32, port: u16, play: Option<Vec<u8>>, leds: u16) -> std::i
             if let Some((index, digest)) = last_frame {
                 println!("  frame #{index} {digest:016x} at show {} us", index * FRAME_US);
             }
+            // Per window. A cumulative average never recovers from the
+            // seconds before a node synchronised, and this is the third time
+            // that has hidden a converged result in this project - S3 learned
+            // it, the clock skew relearned it, and here it was again.
+            if frame_samples > 0 {
+                println!(
+                    "  frames this window: {agree_w} identical, {differ_w} different, {} frame(s) behind its own clock (worst {frame_drift_worst}); report age up to {worst_stale_us} us",
+                    frame_drift_total / frame_samples as i64
+                );
+            }
+            frame_samples = 0;
+            frame_drift_total = 0;
+            frame_drift_worst = 0;
+            agree_w = 0;
+            differ_w = 0;
+            worst_stale_us = 0;
             if skew_samples > 0 {
                 println!(
                     "  clock skew this window: mean {} us, worst {worst_skew_us} us, over {skew_samples} datagrams",

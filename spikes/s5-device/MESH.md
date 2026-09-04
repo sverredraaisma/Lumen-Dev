@@ -92,44 +92,46 @@ multicast against 0.00% on unicast over this same access point, so for the
 handful of peers a house has, addressing them directly is simply better. The
 broadcast remains only to find peers that are not yet known.
 
-## Both nodes now draw the same grid
+## The same picture: proven
 
 Show time is quantised to a 33 333 µs frame grid before rendering, on the device
-and on the peer. Two synchronised nodes never render on the same microsecond, so
-without this two identical clocks would still produce different frames — and
-"the same frame" would be untestable by construction.
+and on the peer, and the grid index is derived from the clock rather than from a
+free-running accumulator. Without that, two identical clocks would still draw
+different frames — the phase would depend on when each loop happened to start,
+and a clock step moves the clock without moving the phase.
 
-The peer renders the effect it gives the device, and both report a frame index
-and a fingerprint:
+The device puts the frame index and its fingerprint in its announcement, and the
+peer renders **that same index** and compares:
 
 ```
-device  == frame #1459 99ff6fbc6d9c2d8f at show 48632847 us
-peer       frame #3605 51254d7e61ace2db at show 120165465 us
+frames this window: 103 identical, 0 different
 ```
 
-## What M2 still owes
+**Zero differences, across every run.** An ESP32-C3 and an x86-64 desktop, given
+the same effect and the same frame number, produce byte-identical pictures. That
+is the "same colour" half of M2, and it is the half that the fixed-point VM, the
+ordered dither and the shared output stage all exist to deliver.
 
-The exit criterion is *"two devices, powered on in either order, discover each
-other, elect a timebase, and change colour on the same frame."* Election,
-discovery and failover are demonstrated. **The last clause is not, and the two
-lines above are why:** they were printed at different wall instants, so they say
-nothing about whether the nodes agreed. Comparing frames needs both fingerprints
-from one moment, which means putting the fingerprint on the wire — a small
-protocol addition, and the obvious next step.
+## The same *moment*: not settled here
 
-The clock evidence bounds it. Skew measured one-way is **4 ms** when the peer
-only elects and syncs, and **13–24 ms** once it is also rendering at 30 fps in
-the same loop — the extra being its own receive latency, not the mesh's. Against
-a 33 ms frame, the second figure is close enough to a frame period that the two
-nodes may genuinely be one frame apart, and no amount of staring at logs will
-say which.
+The frame-index comparison is confounded by two things this harness cannot
+separate cleanly:
 
-So: the timebase is shared to within milliseconds, and whether that lands both
-nodes on the same frame is measured, unproven, and marginal. That is worth
-knowing precisely rather than claiming either way.
+- **Report staleness.** The index travels in an announcement sent on its own
+  cadence, so it describes a frame already drawn. Timestamping the announcement
+  helps and does not eliminate it.
+- **Runs where the follower had not converged.** One measurement showed the peer
+  8.9 s ahead — that is a device still joining, not a mesh disagreeing, and
+  averaging across it says nothing.
 
-Two devices with LEDs settle the visible half in a second. One ESP32-S3 is on the
-desk and was not connected when this ran.
+What can be said honestly: clock skew from header timestamps is **4 ms** when the
+peer only elects and syncs, and **13–24 ms** once it is also rendering. Against a
+33 ms frame that is close enough to a frame period that the two nodes may be one
+frame apart, and this harness cannot tell one frame from none.
+
+**Two devices with LEDs settle it in a second by eye**, which is the right
+instrument for this particular question. One ESP32-S3 is on the desk; its serial
+port disappeared partway through this work and it was never connected.
 
 ## Running it
 

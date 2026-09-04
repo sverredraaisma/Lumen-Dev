@@ -138,7 +138,17 @@ const MESH_UUID: [u8; 16] = [
 /// Peers this device will remember an address for. A house is not a datacentre.
 const MAX_PEERS: usize = 8;
 
-/// Two bytes: "a Lumen device is here", and whether it already holds a program.
+/// "A Lumen device is here", what it holds, and what it just drew.
+///
+/// `[0xA5, has_program, frame_index(8), digest(8)]`, little-endian. The marker
+/// cannot be mistaken for a datagram: every header starts with `0x4C`.
+///
+/// The frame index and fingerprint are what make "changing colour on the same
+/// frame" measurable. A peer receiving this renders that *same* index and
+/// compares - which answers whether the two agree about the picture - and
+/// compares the index against the one it is drawing now, which answers whether
+/// they agree about the moment. Two logs from different instants can answer
+/// neither, which is exactly where this was stuck.
 ///
 /// The second byte is what makes the test repeatable. A device that reboots -
 /// or is reflashed mid-transfer, which is how this was found - comes back with
@@ -359,7 +369,7 @@ fn device_loop(
     println!("== waiting for a lease");
     let mut have_lease = false;
     let mut next_hello_us = 0u64;
-    let mut next_frame_us = 0u64;
+    let mut last_frame_index = u64::MAX;
     let mut frames: u32 = 0;
     let mut spent_total: u64 = 0;
     let mut next_report_us = 0u64;
@@ -398,7 +408,6 @@ fn device_loop(
                 led_strip.name()
             );
                 have_lease = true;
-                next_frame_us = now_us();
                 next_report_us = now_us() + 5_000_000;
             }
             continue;
@@ -418,8 +427,22 @@ fn device_loop(
                 addr: IpAddress::Ipv4(Ipv4Address::new(255, 255, 255, 255)),
                 port: PORT,
             };
-            let _ = socket.send_slice(&[HELLO, u8::from(lumen.program_bytes() > 0)], to);
-            next_hello_us = t + if announced {
+            let mut hello = [0u8; 26];
+            hello[0] = HELLO;
+            hello[1] = u8::from(lumen.program_bytes() > 0);
+            if let Some(r) = last_render {
+                hello[2..10].copy_from_slice(&(r.show_us / FRAME_US).to_le_bytes());
+                hello[10..18].copy_from_slice(&r.digest.to_le_bytes());
+            }
+            // The show time *now*, so a receiver can tell a stale report from a
+            // disagreement. Without it the frame index and the clock cannot be
+            // told apart: a node reporting a frame it drew 150 ms ago looks
+            // exactly like one whose clock is 150 ms out.
+            hello[18..26].copy_from_slice(&t.to_le_bytes());
+            let _ = socket.send_slice(&hello, to);
+            // Every second while there is a frame to report, so a peer has
+            // samples to compare; five when there is nothing to say.
+            next_hello_us = t + if announced && last_render.is_none() {
                 HELLO_INTERVAL_US * 5
             } else {
                 HELLO_INTERVAL_US
@@ -448,8 +471,9 @@ fn device_loop(
             let socket = sockets.get_mut::<udp::Socket>(udp_handle);
             let mut buf = [0u8; 1500];
             while let Ok((n, meta)) = socket.recv_slice(&mut buf) {
-                if buf[0] == HELLO && n <= 2 {
-                    // Another device announcing itself. Not ours to answer.
+                if buf[0] == HELLO {
+                    // Another device announcing itself. Not ours to answer, and
+                    // unmistakable: every datagram header starts with 0x4C.
                     continue;
                 }
                 datagrams += 1;
@@ -538,16 +562,21 @@ fn device_loop(
         }
 
         let t = show_now;
-        if t >= next_frame_us {
-            // Absolute rather than `t + FRAME_US`, so a slow frame does not push
-            // every later one late. A show clock that drifts because rendering
-            // was briefly slow is a show clock that no longer agrees with the
-            // rest of the mesh.
-            next_frame_us += FRAME_US;
-            if next_frame_us < t {
-                next_frame_us = t + FRAME_US;
-            }
-
+        // Locked to the grid, not to an accumulator.
+        //
+        // `next_frame_us += FRAME_US` from an arbitrary start free-runs: the
+        // node renders every 33 ms, but *which* 33 ms depends on when its loop
+        // happened to begin, and a clock step moves the clock without moving the
+        // phase. Two nodes agreeing on the time to within milliseconds still
+        // rendered six frames apart, and eleven at worst - measured, not
+        // guessed, by comparing frame indices over the wire.
+        //
+        // Deriving the index from the clock removes the phase entirely: every
+        // node in the mesh draws frame N when its show clock is in frame N, so
+        // agreeing about the time is the same thing as agreeing about the frame.
+        let frame_index = t / FRAME_US;
+        if frame_index != last_frame_index {
+            last_frame_index = frame_index;
             let before = now_us();
             lumen.advance(t);
             program_bytes = lumen.program_bytes();
