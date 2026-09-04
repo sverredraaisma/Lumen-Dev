@@ -241,6 +241,28 @@ naming one, and this spike has no records — so a source takes the slot of the
 program that most recently finished arriving. That is the controller's contract
 here, and it is the one place this device is not the real thing.
 
+## `curl` turns the room red, and it clears itself
+
+M6 asks for exactly that sentence. One request, no second one:
+
+```
+6626 units/frame                                 breathe alone
+program complete: 1604 bytes, 76 units/pixel     the curl arrives
+source pushed at priority 230
+8906 units/frame                                 both rendering - red
+6626 units/frame                                 expired; breathe alone again
+```
+
+The endpoint is sixty lines of `TcpListener` rather than an HTTP crate and an
+async runtime, for a server answering three paths on a LAN. It is **not**
+public-facing and must not become one: no authentication, no TLS, no size limit
+beyond the read buffer. It trusts a home network, which is the boundary the rest
+of this protocol already assumes — and if that boundary moves, this goes first.
+
+The `seconds` parameter is clamped to 1–300 rather than honoured. The expiry is
+the safety property that stops a room being red for ever, so a query string does
+not get to ask for zero or for an afternoon.
+
 ## Two things left out on purpose
 
 **`ProgEnd` carries a zeroed hash and signature, and the device does not check

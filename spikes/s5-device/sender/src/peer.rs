@@ -113,6 +113,7 @@ pub fn run(
     alert: Option<Vec<u8>>,
     alert_every: Duration,
     alert_lasts_us: u64,
+    http_port: Option<u16>,
 ) -> std::io::Result<()> {
     let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port))?;
     socket.set_broadcast(true)?;
@@ -168,6 +169,14 @@ pub fn run(
     // still underneath when the alert expires by itself.
     let mut next_alert = Instant::now() + alert_every;
     let mut provisioned: Option<SocketAddr> = None;
+
+    // Anything that can `curl` can now light the room. The endpoint only asks;
+    // the mesh loop decides, so nothing on that thread touches the socket or
+    // the node.
+    let (http_tx, http_rx) = std::sync::mpsc::channel::<crate::http::Request>();
+    if let Some(port) = http_port {
+        crate::http::serve(port, http_tx);
+    }
 
     let mut buf = [0u8; 1500];
     loop {
@@ -287,13 +296,22 @@ pub fn run(
                     }
                 }
 
+                // Any announcement tells us where a device is. Learning the
+                // address only while *giving* one a program meant a device that
+                // already held one could never be sent an alert - which is the
+                // case every time this reconnects to a running mesh.
+                if n >= 2 && buf[0] == 0xA5 {
+                    if let SocketAddr::V4(v4) = from {
+                        provisioned = Some(SocketAddr::V4(SocketAddrV4::new(*v4.ip(), port)));
+                    }
+                }
+
                 // A device announcing that it holds nothing gets the effect.
                 if n >= 2 && buf[0] == 0xA5 && buf[1] == 0 {
                     if let (Some(code), SocketAddr::V4(v4)) = (&play, from) {
                         let to = SocketAddr::V4(SocketAddrV4::new(*v4.ip(), port));
                         if crate::provision(&socket, to, code, &mut sequence, now).is_ok() {
                             println!("  gave {} the effect", v4.ip());
-                            provisioned = Some(to);
                         }
                     }
                     continue;
@@ -323,6 +341,52 @@ pub fn run(
             let index = now / FRAME_US;
             if last_frame.map(|(i, _)| i) != Some(index) {
                 last_frame = Some((index, l.frame(index * FRAME_US)));
+            }
+        }
+
+        // Whatever HTTP asked for, carried out here rather than on its thread.
+        while let Ok(request) = http_rx.try_recv() {
+            match request {
+                crate::http::Request::Alert(seconds) => {
+                    if let (Some(code), Some(to)) = (&alert, provisioned) {
+                        if crate::push_program(
+                            &socket,
+                            to,
+                            code,
+                            &mut sequence,
+                            now,
+                            1,
+                            230,
+                            seconds * 1_000_000,
+                            [9; 16],
+                        )
+                        .is_ok()
+                        {
+                            println!("  HTTP: alert for {seconds} s");
+                        }
+                    } else {
+                        println!("  HTTP: asked for an alert with no device or no --alert effect");
+                    }
+                }
+                crate::http::Request::Off => {
+                    if let Some(to) = provisioned {
+                        let _ = crate::send(
+                            &socket,
+                            to,
+                            lumen_proto::header::MsgType::SrcPop,
+                            &mut sequence,
+                            now,
+                            |w| {
+                                lumen_proto::msg::SrcPop {
+                                    source_id: Uuid([7; 16]),
+                                    fade_out_ms: 400,
+                                }
+                                .encode(w)
+                            },
+                        );
+                        println!("  HTTP: off");
+                    }
+                }
             }
         }
 

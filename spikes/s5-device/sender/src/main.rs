@@ -23,6 +23,7 @@
 //! cargo run --release -- --list          # what effects are to hand
 //! ```
 
+mod http;
 mod peer;
 mod simulate;
 
@@ -68,6 +69,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("       sender <effect.lfx> --simulate [--leds N] [--fps N]");
         eprintln!("       sender <effect.lfx> --verify <show_us> [--leds N]");
         eprintln!("       sender --peer [--capacity N]     second node in the mesh");
+        eprintln!("              [--alert e.lfx [--http PORT] [--alert-every N] [--alert-lasts N]]");
         eprintln!("       sender --list");
         return Ok(());
     }
@@ -114,8 +116,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             play,
             arg_value(&args, "--leds").unwrap_or(30) as u16,
             alert,
-            Duration::from_secs(arg_value(&args, "--alert-every").unwrap_or(20)),
+            // No repeating alert unless asked: a timer that fires every twenty
+            // seconds is a demonstration, not a default.
+            Duration::from_secs(arg_value(&args, "--alert-every").unwrap_or(365 * 86_400)),
             arg_value(&args, "--alert-lasts").unwrap_or(6) * 1_000_000,
+            args.iter()
+                .any(|a| a == "--http")
+                .then(|| arg_value(&args, "--http").unwrap_or(8080) as u16),
         )
         .map_err(Into::into);
     }

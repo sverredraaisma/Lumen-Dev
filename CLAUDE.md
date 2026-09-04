@@ -140,6 +140,7 @@ Three assumptions carry the architecture, and all three need real hardware:
 | S4 | Splitting the pixel loop across an S3's two cores | Faster, and byte-identical to one core | **passes: 2.1×, identical** |
 | S5 | A whole device: WiFi, the protocol, the render loop, a real strip | A program written on a desktop lights real LEDs | **passes: 30 fps on a C3** |
 | M2 | Two nodes elect a timebase, and the survivor takes over | Election, sync, failover | **election and failover pass; "same frame" not shown** |
+| M6 | `curl` turns the room red for 30 s and it clears itself | One request, no second one | **passes** (the audio half needs capture hardware) |
 
 **S2 ran on a C3 and passed on the thing that mattered, not on its own
 criterion.** Every corpus effect renders 300 pixels inside a 60 fps frame, the
