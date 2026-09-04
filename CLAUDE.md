@@ -10,7 +10,13 @@ across repo boundaries. **Start here** if you need the design.
   zones, projections and render loop, W7 records and replication, W13 channels
   and W16 gateway policy in `lumen-device`; W8 simulator; W11 preview daemon;
   W15 stdlib and example corpus; the codec conformance suite in `lumen-spec`.
-  Blocked on hardware: the three spikes, W9 firmware, W12/W18 Android and AR.
+  **The chain runs end to end on real hardware.** A phone compiles an effect,
+  finds a node, transfers the program, claims a channel and drives it from a
+  slider; an ESP32-C3 renders it through the real VM at 30 fps and drives 30
+  SK6812 RGBW LEDs over SPI/DMA, with power derating against its supply. Spikes
+  S1-S5 are all measured. What W9 and W12 still owe is the shape around that:
+  provisioning, pairing, NVS, OTA, multiple devices, zones. W18 (AR) is
+  untouched beyond the decoder.
 
 ## Layout — siblings, not submodules
 
@@ -88,6 +94,20 @@ later in a dependent repo.
 | Why the licence split is where it is; the four cross-cutting rules | `CONTRIBUTING.md` | Any design decision |
 
 Per-repo notes live in that repo's `docs/` and its own `CLAUDE.md`.
+
+## What runs on hardware today
+
+`spikes/s5-device` is a whole node - WiFi, the protocol, the source stack, the
+render loop, the output stage, an LED driver - and `lumen-android` is a phone
+that drives it. Between them they exercise nearly every part of the design
+against real silicon, which is why the last few days have found more bugs than
+the previous months of host tests: **each one was only wrong across frames, on a
+device, over a network.**
+
+They are still a spike and an app, not W9 and W12. Missing: provisioning and
+pairing, NVS, OTA, more than one device, zones that are not "the whole strip",
+and any of the reliability the plan asks for. What they prove is that the
+architecture works, which is what a spike is for.
 
 ## Nothing large should start before the spikes
 
