@@ -97,13 +97,27 @@ Three assumptions carry the architecture, and all three need real hardware:
 |---|---|---|---|
 | S1 | Time sync across 3 ESP32s on ordinary WiFi, 24 h | 95th percentile offset under ±500 µs, no drift | **fails the number, meets the requirement** |
 | S2 | Bytecode interpreter in Rust, per-pixel, 300 LEDs | 60 fps with ≥1000 instructions/pixel headroom on an S3 | **conditional pass** |
-| S3 | Multicast CHAN at 60 Hz to 10+ devices on a consumer AP | Loss under 1%, jitter under a frame | not run |
+| S3 | Multicast CHAN at 60 Hz to 10+ devices on a consumer AP | Loss under 1%, jitter under a frame | **multicast fails, unicast passes on loss** |
 
 **S2 ran on a C3 and passed on the thing that mattered, not on its own
 criterion.** Every corpus effect renders 300 pixels inside a 60 fps frame, the
 worst at 86% — but the criterion asked for ≥1000 instructions/pixel of headroom
 and a C3 has about 60. That number was written before anything was measured. The
 comfortable envelope is 300 LEDs at 30 fps or 150 at 60.
+
+**S3 ran with one sender and two receivers.** Multicast loses **4-6%** against a
+1% criterion - an unacknowledged frame sent once at a low basic rate is simply
+gone if missed - while **unicast lost nothing at all** over three consecutive
+windows. Both miss the jitter criterion: arrivals sit at the send interval at the
+median but p95 is around 26 ms, one and a half frames. So the channel design
+needs the unicast fallback the plan prepared, and receivers must render on the
+show clock rather than on arrival.
+
+Four of five runs produced a wrong answer first, each for a different reason, and
+`spikes/s3-multicast/RESULTS.md` records them because each looked like a result:
+the sender dropping its own packets, a cumulative average that never recovers
+from a bad start, and a sleeping receiver that is indistinguishable from a lossy
+network until you notice its twin is fine.
 
 **S1 ran on two boards over a domestic AP.** It misses ±500 µs at p95 — the best
 the specified algorithm managed was p50 225 µs, p95 675 µs — but that is 4% of a

@@ -5,7 +5,7 @@ members = ["crates/canary"]
 # cross-compiles to a device target and cannot run here; its generator is a host
 # crate, but building it as a member would drag `lumen-vm` into the canary's
 # feature unification for no benefit.
-exclude = ["spikes/s1-time-sync", "spikes/s2-vm-throughput", "spikes/s2-vm-throughput-gen"]
+exclude = ["spikes/s1-time-sync", "spikes/s3-multicast", "spikes/s2-vm-throughput", "spikes/s2-vm-throughput-gen"]
 
 [workspace.package]
 version = "0.1.0"

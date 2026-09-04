@@ -1,0 +1,47 @@
+[package]
+name = "s3-multicast"
+description = "Spike S3: does multicast CHAN at 60 Hz reach every device on a consumer AP?"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "s3-multicast"
+path = "src/main.rs"
+
+[dependencies]
+esp-hal = { version = "0.23", features = ["esp32c3"] }
+# `log` here and on esp-wifi so the driver's own messages come out. Without them
+# a failed association is indistinguishable from a hang, which cost an hour.
+esp-println = { version = "0.13", default-features = false, features = ["esp32c3", "jtag-serial", "log"] }
+log = "0.4"
+esp-backtrace = { version = "0.15", features = ["esp32c3", "println", "panic-handler"] }
+esp-alloc = "0.6"
+# `esp-alloc` is a default feature and must stay on: it provides
+# `esp_wifi_allocate_from_internal_ram`, which the driver's C blobs call. Turning
+# defaults off without re-adding it links cleanly right up to two undefined
+# symbols.
+esp-wifi = { version = "0.12", default-features = false, features = [
+  "esp32c3", "wifi", "smoltcp", "utils", "esp-alloc", "log",
+] }
+
+# Declared here as well as pulled in by esp-wifi, so its features unify. Left to
+# esp-wifi alone it arrives with no protocol at all and fails to compile with
+# "you must enable at least one of proto-ipv4, proto-ipv6, proto-sixlowpan".
+smoltcp = { version = "0.12", default-features = false, features = [
+  "medium-ethernet",
+  "proto-ipv4",
+  "proto-dhcpv4",
+  "socket-udp",
+  "socket-dhcpv4",
+  # A receiver has to join the group, and a consumer AP that never sees an IGMP
+  # membership report is entitled to stop forwarding the traffic - which is
+  # itself one of the things this spike is measuring.
+  "multicast",
+] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = 2

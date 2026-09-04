@@ -137,6 +137,21 @@ not answer is 24-hour stability or anything needing three boards. Findings:
 **S2 has run, on a C3 rather than an S3, and landed on its own third fallback.** Every corpus effect renders 300 pixels inside a 60 fps frame — the worst at 86% of it — so the architecture holds. But the ~1000 instructions/pixel in the criterion was written before measurement and the real figure is about 60, so the honest envelope is **300 LEDs at 30 fps, or 150 at 60**, which is the "accept 30 fps" column. The interpreter turns out to be dispatch-bound (837 ns per instruction, 80% of it dispatch), and the cost model it shipped with mis-ranked effects by 3.8× and has been rewritten from measurement. Findings: `spikes/s2-vm-throughput/RESULTS.md`.
 | S3 | Multicast CHAN at 60 Hz to 10+ devices on a consumer AP | Loss under 1%, jitter under a frame | The channel design needs a unicast fallback before anything is built on it |
 
+**S3 has run, with two receivers rather than ten, and landed on its stated
+fallback.** Multicast loses 4-6% where the criterion is 1%; unicast, on the same
+devices and the same access point minutes apart, lost nothing across three
+consecutive windows. The difference is that a multicast frame is sent once with
+no acknowledgement and no retry, so a frame the receiver misses is gone, while
+unicast is retried by the radio.
+
+Jitter misses in both modes - p95 around 26 ms against a 16.7 ms frame - which
+says receivers must render on the show clock and hold the last value, not render
+on arrival. That is what the design already specifies; it is now measured.
+
+What two receivers cannot show is how the AP behaves as a multicast group grows,
+or what unicast costs in airtime at ten devices, where it is ten sends per tick
+against multicast's one. Findings: `spikes/s3-multicast/RESULTS.md`.
+
 S1 and S2 together are the architecture. S3 decides how much of the network design needs a plan B. None of them need a compiler, an app, or a protocol — a few hundred lines each.
 
 ### Then
