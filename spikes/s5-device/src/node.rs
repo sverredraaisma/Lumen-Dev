@@ -97,10 +97,6 @@ pub struct Node {
 
     /// Linear light, before the output stage turns it into codes.
     frame: Vec<Rgb>,
-    /// The output stage's dither state, one entry per channel, carried between
-    /// frames. Without it the dark end of every fade lands in four visible
-    /// steps and then stops early.
-    residual: Vec<i32>,
     output: Output,
 }
 
@@ -150,7 +146,6 @@ impl Node {
             clock_offset_us: 0,
             rendering: false,
             frame: vec![Rgb::BLACK; count as usize],
-            residual: vec![0; count as usize * 3],
             // A 500 mA budget, which is what a USB port promises without
             // negotiating for more. Thirty of these at full white want about
             // 1.2 A, so this strip *will* derate - which is the point: a board
@@ -408,7 +403,11 @@ impl Node {
             linear[i * 3 + 1] = px.g;
             linear[i * 3 + 2] = px.b;
         }
-        let encoded = self.output.encode(&linear[..n], Some(&mut self.residual), out);
+        // The dither's phase comes from show time, so every device in the mesh
+        // dithers this frame the same way. A local frame counter would work on
+        // one device and make two of them disagree at the dark end.
+        let phase = (show_us / 33_333) as u32;
+        let encoded = self.output.encode(&linear[..n], phase, out);
         Some((report.spent, encoded))
     }
 
