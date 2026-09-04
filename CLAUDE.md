@@ -95,6 +95,25 @@ later in a dependent repo.
 
 Per-repo notes live in that repo's `docs/` and its own `CLAUDE.md`.
 
+## M2, most of the way
+
+`spikes/s5-device/MESH.md`. A C3 and a desktop peer running the *same*
+`lumen_device::node::Node` elect a leader by capacity, the follower disciplines
+its clock to sub-millisecond corrections, and killing the leader produces
+`show clock lost` then `now Leader in epoch 2`. Election, discovery and failover
+are demonstrated on real hardware.
+
+**"Change colour on the same frame" is not**, and that is what M2 still owes.
+Both nodes agree on show time and `lumen-vm::digest` proves a host and a device
+render identical frames for the same show time - but nothing yet renders one
+effect on two nodes at once and compares. Two devices with LEDs settle it by eye.
+
+It found three bugs a lossless simulated network cannot: **one lost datagram
+deadlocked time sync for ever** (the outstanding probe was cleared only by a
+matching answer), the **slew rate was silently zero** to integer division, and a
+join offset was being slewed at 200 ppm rather than stepped - a day's work for a
+clock reporting itself synced throughout.
+
 ## What runs on hardware today
 
 `spikes/s5-device` is a whole node - WiFi, the protocol, the source stack, the
@@ -120,6 +139,7 @@ Three assumptions carry the architecture, and all three need real hardware:
 | S3 | Multicast CHAN at 60 Hz to 10+ devices on a consumer AP | Loss under 1%, jitter under a frame | **multicast fails, unicast passes on loss** |
 | S4 | Splitting the pixel loop across an S3's two cores | Faster, and byte-identical to one core | **passes: 2.1×, identical** |
 | S5 | A whole device: WiFi, the protocol, the render loop, a real strip | A program written on a desktop lights real LEDs | **passes: 30 fps on a C3** |
+| M2 | Two nodes elect a timebase, and the survivor takes over | Election, sync, failover | **election and failover pass; "same frame" not shown** |
 
 **S2 ran on a C3 and passed on the thing that mattered, not on its own
 criterion.** Every corpus effect renders 300 pixels inside a 60 fps frame, the

@@ -23,6 +23,7 @@
 //! cargo run --release -- --list          # what effects are to hand
 //! ```
 
+mod peer;
 mod simulate;
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
@@ -64,8 +65,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() || args[0] == "--help" {
         eprintln!("usage: sender <effect.lfx | program.lfxb> [--priority N] [--seconds N]");
+        eprintln!("       sender <effect.lfx> --simulate [--leds N] [--fps N]");
+        eprintln!("       sender <effect.lfx> --verify <show_us> [--leds N]");
+        eprintln!("       sender --peer [--capacity N]     second node in the mesh");
         eprintln!("       sender --list");
         return Ok(());
+    }
+
+    // Before the effect is read: a peer plays nothing, it only elects and
+    // syncs, so requiring a file it will not compile would be a poor joke.
+    if args.iter().any(|a| a == "--peer") {
+        return peer::run(
+            arg_value(&args, "--capacity").unwrap_or(2_000) as u32,
+            PORT,
+        )
+        .map_err(Into::into);
     }
 
     let source_path = &args[0];

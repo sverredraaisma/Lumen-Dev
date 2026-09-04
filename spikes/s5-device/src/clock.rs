@@ -23,6 +23,18 @@
 /// Parts per million the clock may run fast or slow while correcting.
 const SLEW_PPM: i64 = 200;
 
+/// Beyond this, a correction is applied at once instead of slewed.
+///
+/// A device joining a show that has been running for a minute is not a device
+/// that has drifted - it is one that did not know the time. Slewing 17 seconds
+/// at 200 ppm takes a day, and the first version of this did exactly that: the
+/// follower reported `synced` while sitting seventeen seconds behind the leader
+/// for as long as anyone cared to watch.
+///
+/// 100 ms is far larger than any drift this will see - S1 measured p95 offsets
+/// of 1.5 ms - and far smaller than a join. Nothing real lands in between.
+const STEP_ABOVE_US: i64 = 100_000;
+
 /// A monotonic microsecond clock that can be disciplined without jumping.
 pub struct ShowClock {
     /// Hardware microseconds at the last advance.
@@ -31,6 +43,15 @@ pub struct ShowClock {
     now_us: u64,
     /// Correction still to be worked off, signed.
     pending_us: i64,
+    /// Slew budget accumulated but not yet worth a whole microsecond.
+    ///
+    /// Without this the slew rate is zero. `elapsed * PPM / 1_000_000` is an
+    /// integer division, and this clock is advanced thousands of times a second,
+    /// so `elapsed` is tens of microseconds and every interval's budget rounds
+    /// to nothing. The correction then never moves at all - which is precisely
+    /// what a real follower did, sitting at exactly the same `pending` value
+    /// through every report.
+    slew_numer: i64,
 }
 
 impl ShowClock {
@@ -44,6 +65,7 @@ impl ShowClock {
             last_raw_us: raw_us,
             now_us: 0,
             pending_us: 0,
+            slew_numer: 0,
         }
     }
 
@@ -56,11 +78,14 @@ impl ShowClock {
         let elapsed = raw_us.saturating_sub(self.last_raw_us);
         self.last_raw_us = raw_us;
 
-        // The correction this interval may absorb, at the slew rate. Integrated
-        // over the interval rather than recomputed from the total, because drift
-        // is a rate error: a clock corrected by "half of what is left" every
-        // time never actually arrives.
-        let budget = (elapsed as i64).saturating_mul(SLEW_PPM) / 1_000_000;
+        // The correction this interval may absorb, at the slew rate. The
+        // remainder is carried rather than discarded: advancing this clock a
+        // hundred microseconds at a time otherwise rounds every interval's
+        // budget to zero and the correction never arrives.
+        self.slew_numer += (elapsed as i64).saturating_mul(SLEW_PPM);
+        let budget = self.slew_numer / 1_000_000;
+        self.slew_numer -= budget * 1_000_000;
+
         let applied = self.pending_us.clamp(-budget, budget);
         self.pending_us -= applied;
 
@@ -81,7 +106,15 @@ impl ShowClock {
     /// first has been absorbed means both were measured against a clock that was
     /// wrong, and dropping either would leave the error in.
     pub fn discipline(&mut self, offset_us: i64) {
-        self.pending_us = self.pending_us.saturating_add(offset_us);
+        let total = self.pending_us.saturating_add(offset_us);
+        if total.abs() > STEP_ABOVE_US {
+            // Too far out to be drift. Step once and start slewing from there.
+            self.now_us = self.now_us.saturating_add_signed(total).max(self.now_us);
+            self.pending_us = 0;
+            self.slew_numer = 0;
+        } else {
+            self.pending_us = total;
+        }
     }
 
     /// Correction still outstanding. Diagnostic: a device that never converges
@@ -154,6 +187,50 @@ mod tests {
             last = now;
         }
         assert_eq!(c.pending_us(), 0, "did not converge in 30 s");
+    }
+
+    #[test]
+    fn a_correction_arrives_even_when_the_clock_is_advanced_constantly() {
+        // The bug a two-node test found. `elapsed * ppm / 1_000_000` is an
+        // integer division, and this clock is advanced thousands of times a
+        // second - so every interval's budget rounded to zero and a follower sat
+        // seventeen seconds behind its leader reporting itself synced.
+        let mut c = ShowClock::new(0);
+        c.advance_to(1_000_000);
+        c.discipline(1_000);
+
+        // Ten seconds, advanced every 100 us as a real loop does.
+        let mut raw = 1_000_000;
+        for _ in 0..100_000 {
+            raw += 100;
+            c.advance_to(raw);
+        }
+        assert_eq!(c.pending_us(), 0, "the correction never arrived");
+    }
+
+    #[test]
+    fn a_correction_too_large_to_be_drift_is_applied_at_once() {
+        // Joining a show already running is not drifting. Seventeen seconds at
+        // 200 ppm is a day, and a follower would report itself synced through
+        // all of it.
+        let mut c = ShowClock::new(0);
+        c.advance_to(1_000_000);
+        let before = c.now_us();
+        c.discipline(17_000_000);
+        assert_eq!(c.pending_us(), 0);
+        assert_eq!(c.now_us(), before + 17_000_000);
+    }
+
+    #[test]
+    fn a_correction_small_enough_to_be_drift_is_still_slewed() {
+        // The threshold must not swallow the case it exists to protect. S1
+        // measured p95 offsets of 1.5 ms; those must never step.
+        let mut c = ShowClock::new(0);
+        c.advance_to(1_000_000);
+        let before = c.now_us();
+        c.discipline(1_500);
+        assert_eq!(c.pending_us(), 1_500);
+        assert_eq!(c.now_us(), before, "stepped when it should have slewed");
     }
 
     #[test]

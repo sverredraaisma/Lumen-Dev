@@ -60,7 +60,6 @@ pub enum Handled {
     SourcePushed { priority: u8 },
     SourcePopped,
     SourceRejected,
-    ClockSet { offset_us: i64 },
 }
 
 /// One Lumen node.
@@ -88,10 +87,6 @@ pub struct Node {
     expected_len: usize,
     receiving: bool,
 
-    /// Show time minus device time. A `Tick` sets it; until one arrives the
-    /// device runs on its own clock, which is right for one device alone and
-    /// wrong for two.
-    clock_offset_us: i64,
     /// Whether a source is currently admitted, so `main` can say so once rather
     /// than every frame.
     pub rendering: bool,
@@ -144,7 +139,6 @@ impl Node {
             program_len: 0,
             expected_len: 0,
             receiving: false,
-            clock_offset_us: 0,
             rendering: false,
             frame: vec![Rgb::BLACK; count as usize],
             // A 500 mA budget, which is what a USB port promises without
@@ -176,9 +170,14 @@ impl Node {
         self.stack.active().len()
     }
 
-    /// Device time to show time.
+    /// Show time, which the caller already holds.
+    ///
+    /// This used to add an offset learned from `Tick`. It no longer does: the
+    /// mesh owns the clock now, disciplined by election and sync in
+    /// `lumen_device::node::Node`, and a second authority applying its own
+    /// correction on top would be two clocks fighting over one show.
     pub fn show_time(&self, now_us: u64) -> u64 {
-        now_us.saturating_add_signed(self.clock_offset_us)
+        now_us
     }
 
     /// Take one datagram off the wire.
@@ -197,12 +196,8 @@ impl Node {
         };
 
         match payload {
-            Payload::Tick(tick) => {
-                let offset = dg.header.show_time_us as i64 - now_us as i64;
-                self.clock_offset_us = offset;
-                let _ = tick;
-                Handled::ClockSet { offset_us: offset }
-            }
+            // `Tick` is not handled here. It is the mesh's, and a device that
+            // also took a clock from it would have two.
 
             Payload::ProgBegin(begin) => {
                 if begin.total_len as usize > MAX_PROGRAM {

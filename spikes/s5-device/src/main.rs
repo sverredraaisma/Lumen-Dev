@@ -365,6 +365,7 @@ fn device_loop(
     let mut program_bytes = 0usize;
     let mut sources = 0usize;
     let mut draw_ua = 0u32;
+    let (mut rx_tick, mut rx_req, mut rx_resp) = (0u32, 0u32, 0u32);
     let mut last_render: Option<node::Rendered> = None;
     let mut render_us = 0u64;
     let mut show_us = 0u64;
@@ -456,6 +457,15 @@ fn device_loop(
                 // the shell's half of that bargain. Bytes 6..10 of the header
                 // are the sender prefix.
                 if n >= 10 {
+                    // What arrives, by type. Counted rather than printed: this
+                    // is the receive loop, and a line per datagram would measure
+                    // `println!`.
+                    match buf[2] {
+                        0x10 => rx_tick += 1,
+                        0x11 => rx_req += 1,
+                        0x12 => rx_resp += 1,
+                        _ => {}
+                    }
                     // Only IPv4 is configured on this interface, so the address
                     // can only be one thing; destructured rather than matched
                     // to say so.
@@ -518,15 +528,6 @@ fn device_loop(
                     }
                     Handled::SourceRejected => println!("== source rejected"),
                     Handled::SourcePopped => println!("== source popped"),
-                    Handled::ClockSet { offset_us } => {
-                        // Only the first. A Tick arrives every second, and a
-                        // line per Tick is both noise and pressure on a serial
-                        // FIFO that a detached host stops draining.
-                        if !announced {
-                            println!("== show clock set, offset {offset_us} us");
-                        }
-                        announced = true;
-                    }
                     Handled::Undecodable => println!("== undecodable datagram"),
                     Handled::NotForThisMesh | Handled::Ignored | Handled::ProgramChunk { .. } => {}
                 }
@@ -578,7 +579,7 @@ fn device_loop(
                 // exactly like an effect that is quietly wrong, and the two are
                 // debugged in completely different places.
                 println!(
-                    "== {frames} frames in 5 s ({} fps), {} units/frame, {datagrams} datagrams, {} mA{}, render {} us, show {} us",
+                    "== {frames} frames in 5 s ({} fps), {} units/frame, {datagrams} datagrams, {} mA{}, render {} us, out {} us",
                     frames / 5,
                     spent_total / frames as u64,
                     draw_ua / 1000,
@@ -596,6 +597,19 @@ fn device_loop(
                     program_bytes, sources
                 );
             }
+            // The show clock itself, so two devices can be compared directly.
+            // `pending` is the correction still being slewed off: a device that
+            // never converges shows one that does not shrink.
+            println!(
+                "== rx: {rx_tick} ticks, {rx_req} sync-reqs, {rx_resp} sync-resps, {peer_count} peer(s)"
+            );
+            println!(
+                "== clock: show {} us, {:?}, {}, pending {} us",
+                show_now,
+                role,
+                if synced { "synced" } else { "unsynced" },
+                clock.pending_us()
+            );
             // The frame fingerprint, so a host or another device can be checked
             // against this one. Printed once per report rather than per frame:
             // it is a spot check, and a line per frame would measure `println!`.
@@ -636,27 +650,38 @@ fn apply_mesh(
             Action::SetTimer { in_us } => {
                 deadline = deadline.min(now_us.saturating_add(*in_us));
             }
-            Action::Send { to, datagram, .. } => {
-                let addr = match to {
-                    Destination::Mesh => Some(Ipv4Address::new(255, 255, 255, 255)),
-                    // A peer we have never heard from has no address yet, and
-                    // dropping the datagram is right: it will be re-sent when
-                    // the core next asks, by which time the peer has almost
-                    // certainly announced itself.
-                    Destination::Peer(prefix) => peers
-                        .iter()
-                        .find(|(p, _)| p == prefix)
-                        .map(|(_, addr)| *addr),
-                };
-                if let Some(addr) = addr {
-                    let to = IpEndpoint {
-                        addr: IpAddress::Ipv4(addr),
-                        port: PORT,
-                    };
-                    let _ = socket.send_slice(datagram, to);
+            Action::Send { to, datagram, .. } => match to {
+                Destination::Mesh => {
+                    // Broadcast *and* unicast to everyone already known.
+                    //
+                    // Spike S3 measured 4-6% loss on multicast over this access
+                    // point against 0.00% on unicast, so for the handful of
+                    // peers a house has, addressing them directly is simply
+                    // better. The broadcast stays only to find peers that are
+                    // not known yet - and a peer whose broadcasts leave by the
+                    // wrong interface, which is what a desktop with a WSL
+                    // adapter does, is then still reachable.
+                    send_to(socket, datagram, Ipv4Address::new(255, 255, 255, 255));
+                    for (_, addr) in peers {
+                        send_to(socket, datagram, *addr);
+                    }
                 }
+                // A peer never heard from has no address yet, and dropping is
+                // right: the core will ask again, by which time it will almost
+                // certainly have announced itself.
+                Destination::Peer(prefix) => {
+                    if let Some((_, addr)) = peers.iter().find(|(p, _)| p == prefix) {
+                        send_to(socket, datagram, *addr);
+                    }
+                }
+            },
+            Action::DisciplineClock { offset_us } => {
+                // Logged because it is rare - once on joining, then every
+                // thirty seconds - and because a device that never prints one
+                // is a device that thinks it is synced and is not.
+                println!("== disciplined by {offset_us} us");
+                clock.discipline(*offset_us);
             }
-            Action::DisciplineClock { offset_us } => clock.discipline(*offset_us),
             Action::RoleChanged { role: r, epoch } => {
                 *role = *r;
                 println!("== now {r:?} in epoch {epoch}");
@@ -679,6 +704,14 @@ fn apply_mesh(
     } else {
         deadline.max(now_us.saturating_add(1_000))
     }
+}
+
+fn send_to(socket: &mut udp::Socket<'_>, datagram: &[u8], addr: Ipv4Address) {
+    let to = IpEndpoint {
+        addr: IpAddress::Ipv4(addr),
+        port: PORT,
+    };
+    let _ = socket.send_slice(datagram, to);
 }
 
 /// Note where a peer lives, keyed by the prefix the core addresses it with.
