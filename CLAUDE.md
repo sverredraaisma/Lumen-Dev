@@ -98,6 +98,7 @@ Three assumptions carry the architecture, and all three need real hardware:
 | S1 | Time sync across 3 ESP32s on ordinary WiFi, 24 h | 95th percentile offset under ±500 µs, no drift | **fails the number, meets the requirement** |
 | S2 | Bytecode interpreter in Rust, per-pixel, 300 LEDs | 60 fps with ≥1000 instructions/pixel headroom on an S3 | **conditional pass, now on the S3 too** |
 | S3 | Multicast CHAN at 60 Hz to 10+ devices on a consumer AP | Loss under 1%, jitter under a frame | **multicast fails, unicast passes on loss** |
+| S4 | Splitting the pixel loop across an S3's two cores | Faster, and byte-identical to one core | **passes: 2.1×, identical** |
 
 **S2 ran on a C3 and passed on the thing that mattered, not on its own
 criterion.** Every corpus effect renders 300 pixels inside a 60 fps frame, the
@@ -127,6 +128,14 @@ must be off** (worth 4× on its own) and **the burst is 32 samples, not 8** (wor
 better than 2×). Longer is not monotonically better — at 128 the crystal's
 33 µs/s drift accumulates inside the window faster than the noise averages out.
 Full findings in `spikes/s1-time-sync/RESULTS.md`.
+
+**S4 answers what a second core is worth**, which S2 raised by finding the
+speed-up from a bigger ESP32 to be entirely its clock. Splitting the *pixels*
+rather than offloading comms is where the headroom is, and it came out slightly
+above 2x - each core's per-LED history map is half the size, so the second core
+makes its own half cheaper too. What it does not answer is contention with a live
+radio, which is the other thing a second core is for and what S3's jitter points
+at. Full findings in `spikes/s4-dual-core/RESULTS.md`.
 
 **S2 has since run on the actual S3**, the chip its criterion named. It is 1.4x
 faster than the C3 - close to the 1.5x its clock ratio predicts - and the worst
@@ -162,9 +171,22 @@ Arduino integration.
 dual-core chips. The short version: yes, but the win is **not** offloading
 comms - it is splitting the *pixel loop*, which is embarrassingly parallel and
 is the part S2 found short. It belongs in the firmware shell, never in the
-sans-IO core, and `lumen-capi` proves the split renders byte-identically to a
-single core, because a two-core device that rendered differently would break the
-mesh's agreement with itself.
+sans-IO core.
+
+**Built and measured.** `lumen_device::render::Shard` is the seam, a board
+declares `render_cores`, and S4 ran it on the S3: **2.08-2.20x over the whole
+shipped corpus, byte-identical to a single core**. The worst effect drops from
+103% of a 60 fps frame to 49%. The identity is the half that decides whether it
+ships - a two-core device rendering a different show would break the mesh's
+agreement with itself - so it is checked in `lumen-capi`, in `lumen-device`, and
+pixel by pixel on hardware in S4.
+
+S4 also found two things worth more than the split, both now fixed: the render
+loop was charging the `frame` section the header's **per-pixel** budget, which
+faulted `07-alert` every frame so it rendered nothing; and it looked an LED up
+with a linear scan **per pixel**, quadratic in the strip and worth 20-25% of
+every frame. Both were free in every host test, because every host test is four
+LEDs long.
 
 ## Compact instructions
 

@@ -1,0 +1,33 @@
+[package]
+name = "s4-dual-core"
+description = "Spike S4: does splitting the pixel loop across the S3's two cores actually pay, and does it render the same frame?"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "s4-dual-core"
+path = "src/main.rs"
+
+[dependencies]
+esp-hal = { version = "0.23", features = ["esp32s3"] }
+esp-println = { version = "0.13", default-features = false, features = ["esp32s3", "jtag-serial"] }
+esp-backtrace = { version = "0.15", features = ["esp32s3", "println", "panic-handler"] }
+# The render loop allocates - a membership is a Vec, the machines live in a
+# BTreeMap - so a device needs a heap. 64 KiB, sized in main.rs.
+esp-alloc = "0.6"
+
+# The real render loop, not a copy of it. This is the point of the spike: the
+# thing measured here is the `Shard` API a firmware will call, running on the
+# two cores it was written for.
+lumen-device = { path = "../../../lumen-device/crates/lumen-device" }
+lumen-vm = { path = "../../../lumen-core/crates/lumen-vm", default-features = false }
+lumen-proto = { path = "../../../lumen-core/crates/lumen-proto" }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = 2
+
+[workspace]

@@ -1,0 +1,20 @@
+[build]
+target = "xtensa-esp32s3-none-elf"
+
+[target.xtensa-esp32s3-none-elf]
+runner = "espflash flash --monitor"
+rustflags = [
+  # esp-hal ships the vector table and memory layout in this script. Without it
+  # the link fails on every `interruptN` symbol, which is what an ESP32 build
+  # looks like when the linker script has been forgotten.
+  "-C", "link-arg=-Tlinkall.x",
+  "-C", "force-frame-pointers",
+]
+
+# The Xtensa target has no prebuilt core, so it is built from source with the
+# `esp` toolchain rather than downloaded.
+[unstable]
+build-std = ["core", "alloc"]
+
+[env]
+ESP_LOG = "info"
