@@ -138,10 +138,29 @@ const MESH_UUID: [u8; 16] = [
 /// Peers this device will remember an address for. A house is not a datacentre.
 const MAX_PEERS: usize = 8;
 
-/// "A Lumen device is here", what it holds, and what it just drew.
+/// "A Lumen device is here", what it holds, what it just drew, and how it is.
 ///
-/// `[0xA5, has_program, frame_index(8), digest(8)]`, little-endian. The marker
-/// cannot be mistaken for a datagram: every header starts with `0x4C`.
+/// Little-endian, and the marker cannot be mistaken for a datagram: every
+/// header starts with `0x4C`.
+///
+/// | bytes | |
+/// |---|---|
+/// | 0 | `0xA5` |
+/// | 1 | holds a program |
+/// | 2..10 | frame index |
+/// | 10..18 | frame fingerprint |
+/// | 18..26 | show time when sent |
+/// | 26 | role: 0 follower, 1 candidate, 2 leader |
+/// | 27 | synchronised |
+/// | 28..30 | frames per second |
+/// | 30..34 | microamps drawn |
+/// | 34..36 | LEDs |
+///
+/// This is the spike's own discovery format, not a protocol message - the real
+/// thing is mDNS for finding devices and `CAPS` for describing them. It carries
+/// state because an app that can only report an address cannot tell a device
+/// that is rendering from one that is merely reachable, and that difference is
+/// most of what monitoring is.
 ///
 /// The frame index and fingerprint are what make "changing colour on the same
 /// frame" measurable. A peer receiving this renders that *same* index and
@@ -379,6 +398,7 @@ fn device_loop(
     let mut sources = 0usize;
     let mut draw_ua = 0u32;
     let (mut rx_tick, mut rx_req, mut rx_resp) = (0u32, 0u32, 0u32);
+    let mut last_fps = 0u16;
     let mut last_render: Option<node::Rendered> = None;
     let mut render_us = 0u64;
     let mut show_us = 0u64;
@@ -427,7 +447,7 @@ fn device_loop(
                 addr: IpAddress::Ipv4(Ipv4Address::new(255, 255, 255, 255)),
                 port: PORT,
             };
-            let mut hello = [0u8; 26];
+            let mut hello = [0u8; 36];
             hello[0] = HELLO;
             hello[1] = u8::from(lumen.program_bytes() > 0);
             if let Some(r) = last_render {
@@ -439,6 +459,15 @@ fn device_loop(
             // told apart: a node reporting a frame it drew 150 ms ago looks
             // exactly like one whose clock is 150 ms out.
             hello[18..26].copy_from_slice(&t.to_le_bytes());
+            hello[26] = match role {
+                Role::Follower => 0,
+                Role::Candidate => 1,
+                Role::Leader => 2,
+            };
+            hello[27] = u8::from(synced);
+            hello[28..30].copy_from_slice(&last_fps.to_le_bytes());
+            hello[30..34].copy_from_slice(&draw_ua.to_le_bytes());
+            hello[34..36].copy_from_slice(&(LEDS as u16).to_le_bytes());
             let _ = socket.send_slice(&hello, to);
             // Every second while there is a frame to report, so a peer has
             // samples to compare; five when there is nothing to say.

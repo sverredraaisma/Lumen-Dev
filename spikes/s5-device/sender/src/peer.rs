@@ -229,7 +229,7 @@ pub fn run(capacity: u32, port: u16, play: Option<Vec<u8>>, leds: u16) -> std::i
                 // the same picture, and the index difference says whether they
                 // produced it at the same moment. Neither question can be
                 // answered from two logs taken at different instants.
-                if n >= 26 && buf[0] == 0xA5 && buf[1] == 1 {
+                if n >= 36 && buf[0] == 0xA5 && buf[1] == 1 {
                     if let Some(l) = live.as_mut() {
                         let theirs_index = u64::from_le_bytes(
                             buf[2..10].try_into().expect("eight bytes"),
