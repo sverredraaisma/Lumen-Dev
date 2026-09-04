@@ -26,6 +26,7 @@ use lumen_device::zones::{Clause, DeviceLeds, Led, MapQuality, Membership, Proje
 use lumen_device::Renderer;
 use lumen_proto::msg::Payload;
 use lumen_proto::{Datagram, Uuid};
+use lumen_vm::digest::Digest;
 use lumen_vm::output::{Encoded, Output, PowerModel};
 use lumen_vm::program::Program;
 use lumen_vm::q16::Q16;
@@ -365,7 +366,7 @@ impl Node {
     /// `out` is left alone in that case rather than blacked: a device with no
     /// source keeps showing what it was showing, which is what makes an ambient
     /// floor a floor rather than a special case.
-    pub fn render(&mut self, now_us: u64, out: &mut [u8]) -> Option<(u32, Encoded)> {
+    pub fn render(&mut self, now_us: u64, out: &mut [u8]) -> Option<(u32, Encoded, Rendered)> {
         if self.program_len == 0 {
             return None;
         }
@@ -413,7 +414,19 @@ impl Node {
         // one device and make two of them disagree at the dark end.
         let phase = (show_us / 33_333) as u32;
         let encoded = self.output.encode(&linear[..n], phase, out);
-        Some((report.spent, encoded))
+
+        // A fingerprint of what the VM produced, hashed before the output stage
+        // so it is the *render* being compared rather than this device's supply
+        // and brightness. Two devices with different power budgets must still
+        // agree here; that is the claim the whole architecture rests on.
+        Some((
+            report.spent,
+            encoded,
+            Rendered {
+                digest: Digest::of_frame(&linear[..n]),
+                show_us,
+            },
+        ))
     }
 
     /// Drop sources whose expiry has passed.
@@ -425,6 +438,16 @@ impl Node {
             .advance(self.show_time(now_us), &mut Vec::new());
         self.rendering = !self.stack.active().is_empty();
     }
+}
+
+/// What one frame came out as, for comparing against another renderer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Rendered {
+    /// Fingerprint of the linear frame.
+    pub digest: u64,
+    /// The show time it was rendered for. Meaningless without this: two
+    /// devices agreeing on a hash for different moments have proved nothing.
+    pub show_us: u64,
 }
 
 /// Channels the linear staging buffer holds. 300 LEDs, the size the project

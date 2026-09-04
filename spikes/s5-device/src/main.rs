@@ -27,6 +27,24 @@
 //!
 //! Anything else runs the device.
 //!
+//! # It elects a timebase rather than being told one
+//!
+//! The show clock used to come from a `Tick` the desktop sent, which works for
+//! one device and is not a mesh. Devices now run `lumen_device::node::Node` —
+//! the same election and sync state machines the simulator exercises — and agree
+//! among themselves: whoever has the most capacity leads, ties break on the
+//! lower UUID, and everyone else disciplines their clock towards the leader over
+//! 32 filtered round trips.
+//!
+//! Corrections are **slewed, never stepped** (`clock.rs`). Every effect is a
+//! function of this clock, so a step renders a frame twice or skips one — a
+//! visible stutter on every device, every time it resynchronises.
+//!
+//! A cold mesh takes about five seconds to have a leader and a few more to be
+//! synchronised. Until then a device renders on its own clock rather than
+//! waiting: a device is never dark because of software, and unsynchronised
+//! light beats none.
+//!
 //! # It announces itself
 //!
 //! The device broadcasts a one-byte hello. A sender hears it, learns the
@@ -44,6 +62,7 @@
 
 extern crate alloc;
 
+mod clock;
 mod node;
 mod strip;
 mod strip_dma;
@@ -62,6 +81,9 @@ use smoltcp::socket::{dhcpv4, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address};
 
+use clock::ShowClock;
+use lumen_device::node::Node as MeshNode;
+use lumen_device::{Action, Destination, Event, Identity, Role};
 use lumen_proto::Uuid;
 use node::{Handled, Node};
 use strip::{buffer_words, Format, Strip};
@@ -106,6 +128,15 @@ const PORT: u16 = 6354;
 /// Which mesh this device belongs to. A device drops anything with a different
 /// prefix from the header alone, without decrypting.
 const MESH_PREFIX: [u8; 2] = [0x4c, 0x4d];
+
+/// The same mesh, as the UUID the core wants. Its first two bytes are
+/// [`MESH_PREFIX`], because that is what goes on the wire.
+const MESH_UUID: [u8; 16] = [
+    0x4c, 0x4d, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+];
+
+/// Peers this device will remember an address for. A house is not a datacentre.
+const MAX_PEERS: usize = 8;
 
 /// Two bytes: "a Lumen device is here", and whether it already holds a program.
 ///
@@ -288,6 +319,11 @@ fn device_loop(
     socket.bind(PORT).expect("bind");
     let udp_handle = sockets.add(socket);
 
+    // The show clock. Everything below reads this rather than the hardware: it
+    // is what election and sync discipline, and what every effect is a function
+    // of.
+    let mut clock = ShowClock::new(now_us());
+
     // The device's identity. Derived from the MAC so it is stable across
     // reboots and different on every board - a real device would have this
     // provisioned, and two devices sharing a UUID is the kind of thing that
@@ -295,6 +331,27 @@ fn device_loop(
     let mut id = [0u8; 16];
     id[..6].copy_from_slice(&mac);
     let mut lumen = Node::new(MESH_PREFIX, Uuid(id), LEDS as u16);
+
+    // The mesh half: election and time sync, from `lumen-device`. Capacity is a
+    // static benchmark score - VM instructions per second over a thousand, from
+    // Spike S2 - and must never be current load, or the role flaps under it.
+    // Both these chips report the same number and the UUID breaks the tie,
+    // which is exactly what it is for.
+    let capacity = if cfg!(feature = "esp32s3") { 1714 } else { 1194 };
+    let mut mesh = MeshNode::new(
+        Identity::new(Uuid(id), capacity),
+        Uuid(MESH_UUID),
+        0,
+        clock.now_us(),
+    );
+    // Prefix to address, learned from whoever talks to us. The core addresses
+    // peers by UUID prefix and never sees an IP; this is the shell's half of
+    // that bargain.
+    let mut peers: [([u8; 4], Ipv4Address); MAX_PEERS] = [([0; 4], Ipv4Address::UNSPECIFIED); MAX_PEERS];
+    let mut peer_count = 0usize;
+    let mut mesh_deadline_us = 0u64;
+    let mut role = Role::Follower;
+    let mut synced = false;
 
     println!("== waiting for a lease");
     let mut have_lease = false;
@@ -308,6 +365,7 @@ fn device_loop(
     let mut program_bytes = 0usize;
     let mut sources = 0usize;
     let mut draw_ua = 0u32;
+    let mut last_render: Option<node::Rendered> = None;
     let mut render_us = 0u64;
     let mut show_us = 0u64;
     let mut derated = lumen_vm::q16::Q16::ONE;
@@ -364,15 +422,70 @@ fn device_loop(
             };
         }
 
+        // The mesh runs on the show clock, and advancing it is what applies any
+        // outstanding correction. Once per turn, before anything reads the time.
+        let show_now = clock.advance_to(now_us());
+
+        if show_now >= mesh_deadline_us {
+            let actions = mesh.on_event(show_now, Event::Tick);
+            let socket = sockets.get_mut::<udp::Socket>(udp_handle);
+            mesh_deadline_us = apply_mesh(
+                &actions,
+                show_now,
+                socket,
+                &peers[..peer_count],
+                &mut clock,
+                &mut role,
+                &mut synced,
+            );
+        }
+
         {
             let socket = sockets.get_mut::<udp::Socket>(udp_handle);
             let mut buf = [0u8; 1500];
-            while let Ok((n, _meta)) = socket.recv_slice(&mut buf) {
+            while let Ok((n, meta)) = socket.recv_slice(&mut buf) {
                 if buf[0] == HELLO && n <= 2 {
                     // Another device announcing itself. Not ours to answer.
                     continue;
                 }
                 datagrams += 1;
+
+                // Remember where this sender lives, so the core's
+                // `Destination::Peer(prefix)` can become an address. The core
+                // addresses peers by UUID prefix and never sees an IP; this is
+                // the shell's half of that bargain. Bytes 6..10 of the header
+                // are the sender prefix.
+                if n >= 10 {
+                    // Only IPv4 is configured on this interface, so the address
+                    // can only be one thing; destructured rather than matched
+                    // to say so.
+                    let IpAddress::Ipv4(v4) = meta.endpoint.addr;
+                    remember(
+                        &mut peers,
+                        &mut peer_count,
+                        [buf[6], buf[7], buf[8], buf[9]],
+                        v4,
+                    );
+                }
+
+                // Every datagram goes to the mesh as well. It picks out the
+                // three it cares about - TICK, SYNC_REQ, SYNC_RESP - drops
+                // rubbish silently, filters foreign meshes on the prefix, and
+                // ignores its own looped-back multicast, which on an ESP32 is
+                // not hypothetical.
+                let actions = mesh.on_event(show_now, Event::Datagram { bytes: &buf[..n] });
+                if !actions.is_empty() {
+                    mesh_deadline_us = apply_mesh(
+                        &actions,
+                        show_now,
+                        socket,
+                        &peers[..peer_count],
+                        &mut clock,
+                        &mut role,
+                        &mut synced,
+                    );
+                }
+
                 let handled = lumen.receive(&buf[..n], now_us());
                 match handled {
                     // Logged, because these are the ones worth seeing once. The
@@ -420,7 +533,7 @@ fn device_loop(
             }
         }
 
-        let t = now_us();
+        let t = show_now;
         if t >= next_frame_us {
             // Absolute rather than `t + FRAME_US`, so a slow frame does not push
             // every later one late. A show clock that drifts because rendering
@@ -435,10 +548,11 @@ fn device_loop(
             lumen.advance(t);
             program_bytes = lumen.program_bytes();
             sources = lumen.source_count();
-            if let Some((spent, encoded)) = lumen.render(t, pixels) {
+            if let Some((spent, encoded, rendered)) = lumen.render(t, pixels) {
                 spent_total += spent as u64;
                 draw_ua = encoded.draw_ua;
                 derated = encoded.derated_to;
+                last_render = Some(rendered);
                 frames += 1;
                 let rendered = now_us();
                 if led_strip.show(pixels).is_err() {
@@ -482,11 +596,113 @@ fn device_loop(
                     program_bytes, sources
                 );
             }
+            // The frame fingerprint, so a host or another device can be checked
+            // against this one. Printed once per report rather than per frame:
+            // it is a spot check, and a line per frame would measure `println!`.
+            if let Some(r) = last_render {
+                println!("== frame {:016x} at show {} us", r.digest, r.show_us);
+            }
             frames = 0;
             spent_total = 0;
             render_us = 0;
             show_us = 0;
         }
+    }
+}
+
+/// Carry out what the mesh asked for, and return when it wants waking next.
+///
+/// Every action is handled. A shell that quietly ignored one would produce a
+/// mesh that mostly works: `SetTimer` dropped means a node that stops, `Send`
+/// dropped means one that never leads, `DisciplineClock` dropped means one that
+/// never syncs and says it has.
+#[allow(clippy::too_many_arguments)]
+fn apply_mesh(
+    actions: &[Action],
+    now_us: u64,
+    socket: &mut udp::Socket<'_>,
+    peers: &[([u8; 4], Ipv4Address)],
+    clock: &mut ShowClock,
+    role: &mut Role,
+    synced: &mut bool,
+) -> u64 {
+    // The *earliest* of several timers, not the last. A core that asks for
+    // 10 ms and then a second in one batch wants waking in 10 ms, and taking
+    // the last would silently drop the tighter deadline.
+    let mut deadline = u64::MAX;
+
+    for action in actions {
+        match action {
+            Action::SetTimer { in_us } => {
+                deadline = deadline.min(now_us.saturating_add(*in_us));
+            }
+            Action::Send { to, datagram, .. } => {
+                let addr = match to {
+                    Destination::Mesh => Some(Ipv4Address::new(255, 255, 255, 255)),
+                    // A peer we have never heard from has no address yet, and
+                    // dropping the datagram is right: it will be re-sent when
+                    // the core next asks, by which time the peer has almost
+                    // certainly announced itself.
+                    Destination::Peer(prefix) => peers
+                        .iter()
+                        .find(|(p, _)| p == prefix)
+                        .map(|(_, addr)| *addr),
+                };
+                if let Some(addr) = addr {
+                    let to = IpEndpoint {
+                        addr: IpAddress::Ipv4(addr),
+                        port: PORT,
+                    };
+                    let _ = socket.send_slice(datagram, to);
+                }
+            }
+            Action::DisciplineClock { offset_us } => clock.discipline(*offset_us),
+            Action::RoleChanged { role: r, epoch } => {
+                *role = *r;
+                println!("== now {r:?} in epoch {epoch}");
+            }
+            Action::SyncAcquired => {
+                *synced = true;
+                println!("== show clock acquired");
+            }
+            Action::SyncLost => {
+                *synced = false;
+                println!("== show clock lost");
+            }
+        }
+    }
+
+    // A core that returned no timer would simply stop, and the shell has no way
+    // to know it should have. The floor keeps a zero from spinning a core flat.
+    if deadline == u64::MAX {
+        now_us.saturating_add(1_000)
+    } else {
+        deadline.max(now_us.saturating_add(1_000))
+    }
+}
+
+/// Note where a peer lives, keyed by the prefix the core addresses it with.
+///
+/// Oldest entry is overwritten once full. A house with more than eight devices
+/// in earshot is a house that wants a real table, and losing the least recently
+/// added address only costs one retransmission.
+fn remember(
+    peers: &mut [([u8; 4], Ipv4Address); MAX_PEERS],
+    count: &mut usize,
+    prefix: [u8; 4],
+    addr: Ipv4Address,
+) {
+    for slot in peers[..*count].iter_mut() {
+        if slot.0 == prefix {
+            slot.1 = addr;
+            return;
+        }
+    }
+    if *count < MAX_PEERS {
+        peers[*count] = (prefix, addr);
+        *count += 1;
+    } else {
+        peers[0] = (prefix, addr);
     }
 }
 

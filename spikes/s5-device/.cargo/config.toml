@@ -1,5 +1,7 @@
-[build]
-target = "riscv32imc-unknown-none-elf"
+# No `[build] target`: this firmware builds for two chips and the target is
+# passed on the command line. `[unstable] build-std` is deliberately absent for
+# the same reason - it is global rather than per-target, and the C3 builds on
+# stable where `-Z` is refused. The S3 passes it on its own invocation.
 
 [target.riscv32imc-unknown-none-elf]
 runner = "espflash flash --monitor"
@@ -7,6 +9,13 @@ rustflags = [
   # esp-hal ships the vector table and memory layout in this script. Without it
   # the link fails on every `interruptN` symbol, which is what an ESP32 build
   # looks like when the linker script has been forgotten.
+  "-C", "link-arg=-Tlinkall.x",
+  "-C", "force-frame-pointers",
+]
+
+[target.xtensa-esp32s3-none-elf]
+runner = "espflash flash --monitor"
+rustflags = [
   "-C", "link-arg=-Tlinkall.x",
   "-C", "force-frame-pointers",
 ]

@@ -9,18 +9,25 @@ publish = false
 name = "s5-device"
 path = "src/main.rs"
 
+# Which chip. No default: features are additive, so a default would be enabled
+# alongside whatever is asked for and esp-hal would refuse both. Selecting
+# neither fails in esp-hal's build script, which is the right failure.
+[features]
+esp32c3 = ["esp-hal/esp32c3", "esp-println/esp32c3", "esp-backtrace/esp32c3", "esp-wifi/esp32c3"]
+esp32s3 = ["esp-hal/esp32s3", "esp-println/esp32s3", "esp-backtrace/esp32s3", "esp-wifi/esp32s3"]
+
 [dependencies]
-esp-hal = { version = "0.23", features = ["esp32c3"] }
-esp-println = { version = "0.13", default-features = false, features = ["esp32c3", "jtag-serial", "log"] }
+esp-hal = { version = "0.23" }
+esp-println = { version = "0.13", default-features = false, features = ["jtag-serial", "log"] }
 log = "0.4"
 # For holding off interrupts across a strip frame - see the note in strip.rs.
 critical-section = "1.2"
-esp-backtrace = { version = "0.15", features = ["esp32c3", "println", "panic-handler"] }
+esp-backtrace = { version = "0.15", features = ["println", "panic-handler"] }
 esp-alloc = "0.6"
 # `esp-alloc` is a default feature and must stay on: it provides
 # `esp_wifi_allocate_from_internal_ram`, which the driver's C blobs call.
 esp-wifi = { version = "0.12", default-features = false, features = [
-  "esp32c3", "wifi", "smoltcp", "utils", "esp-alloc", "log",
+  "wifi", "smoltcp", "utils", "esp-alloc", "log",
 ] }
 smoltcp = { version = "0.12", default-features = false, features = [
   "medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-udp", "socket-dhcpv4",

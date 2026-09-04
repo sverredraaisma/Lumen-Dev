@@ -104,6 +104,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    if let Some(at) = args.iter().position(|a| a == "--verify") {
+        let show_us = args
+            .get(at + 1)
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        simulate::verify(
+            &bytecode,
+            arg_value(&args, "--leds").unwrap_or(30) as u16,
+            show_us,
+        );
+        return Ok(());
+    }
+
     if args.iter().any(|a| a == "--simulate") {
         simulate::simulate(
             &bytecode,
