@@ -1,0 +1,323 @@
+//! The device, minus its I/O.
+//!
+//! Everything here is "what a Lumen node does with a datagram and with a
+//! frame". It touches no socket and reads no clock — `main.rs` owns those and
+//! passes results in, which is the same seam `lumen-device` draws and the reason
+//! this file can be reasoned about without a radio.
+//!
+//! # What it implements
+//!
+//! A program arrives as `ProgBegin` / `ProgChunk` × n / `ProgEnd`, which is how
+//! bytecode crosses a 1500-byte MTU. A `SrcPush` then puts it on the source
+//! stack with a priority and an expiry. From there the real
+//! `lumen_device::Renderer` produces the pixels, through the real VM, from the
+//! real zone projection.
+//!
+//! Nothing here is a stand-in. That is the point of the spike: if a pixel comes
+//! out wrong, the bug is in something that ships.
+
+use alloc::vec;
+use alloc::vec::Vec;
+
+use lumen_device::render::{Bound, Rgb, Shard};
+use lumen_device::sources::{Source, SourceStack};
+use lumen_device::zones::{Clause, DeviceLeds, Led, MapQuality, Membership, Projection, Zone};
+use lumen_device::Renderer;
+use lumen_proto::msg::Payload;
+use lumen_proto::{Datagram, Uuid};
+use lumen_vm::program::Program;
+use lumen_vm::q16::Q16;
+use lumen_vm::vm::NoUniforms;
+
+/// Largest program this device will hold.
+///
+/// The corpus runs 1–3 KB. Four is room to spare without pretending a device
+/// with 400 KB of RAM can hold something arbitrary.
+pub const MAX_PROGRAM: usize = 4096;
+
+/// What a received datagram did, for the log.
+///
+/// Returned rather than printed, because printing from the middle of a receive
+/// loop is how a spike ends up measuring `println!`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Handled {
+    Ignored,
+    NotForThisMesh,
+    Undecodable,
+    ProgramStarted { len: u32 },
+    ProgramChunk { at: u32, len: usize },
+    ProgramComplete { len: usize, budget: u32 },
+    ProgramRejected,
+    SourcePushed { priority: u8 },
+    SourcePopped,
+    SourceRejected,
+    ClockSet { offset_us: i64 },
+}
+
+/// One Lumen node.
+pub struct Node {
+    mesh_prefix: [u8; 2],
+    leds: DeviceLeds,
+    zone: Zone,
+    membership: Membership,
+    stack: SourceStack,
+    renderer: Renderer,
+
+    /// The program being received, and the one being rendered. The same buffer:
+    /// a device holds one program at a time here, and a half-received program
+    /// replacing a running one is a visible failure the real firmware avoids
+    /// with two slots. Called out rather than hidden — see RESULTS.
+    program: Vec<u8>,
+    program_len: usize,
+    expected_len: usize,
+    receiving: bool,
+
+    /// Show time minus device time. A `Tick` sets it; until one arrives the
+    /// device runs on its own clock, which is right for one device alone and
+    /// wrong for two.
+    clock_offset_us: i64,
+    /// Whether a source is currently admitted, so `main` can say so once rather
+    /// than every frame.
+    pub rendering: bool,
+}
+
+impl Node {
+    /// A node driving `count` LEDs in a line.
+    ///
+    /// The strip's geometry is declared rather than measured, so the quality is
+    /// `Synthetic`: laid along an arbitrary axis from an arbitrary origin.
+    /// `u` still runs 0..1 along it and every 1D effect works, which is the
+    /// point - **mapping is a pure upgrade**, and a device that has never been
+    /// mapped lights correctly rather than waiting to be told where it is.
+    pub fn new(mesh_prefix: [u8; 2], device: Uuid, count: u16) -> Node {
+        let leds = DeviceLeds {
+            device,
+            quality: MapQuality::Synthetic,
+            leds: (0..count)
+                .map(|i| Led {
+                    index: i,
+                    world: [Q16::from_ratio(i as i32, count as i32), Q16::ZERO, Q16::ZERO],
+                    local: [Q16::from_ratio(i as i32, count as i32), Q16::ZERO, Q16::ZERO],
+                })
+                .collect(),
+        };
+        let zone = Zone {
+            id: Uuid([50; 16]),
+            include: vec![Clause::Device { device, leds: None }],
+            exclude: vec![],
+            projection: Projection::Strip,
+        };
+        let membership = zone.resolve(&leds);
+        Node {
+            mesh_prefix,
+            leds,
+            zone,
+            membership,
+            // Per-pixel budget this device will spend across all sources, and
+            // how many it will admit at once. Generous: a C3 rendering 30 LEDs
+            // has far more headroom per pixel than one rendering 300, and the
+            // budget is per pixel.
+            stack: SourceStack::new(100_000, 4),
+            renderer: Renderer::new(),
+            program: vec![0; MAX_PROGRAM],
+            program_len: 0,
+            expected_len: 0,
+            receiving: false,
+            clock_offset_us: 0,
+            rendering: false,
+        }
+    }
+
+    pub fn led_count(&self) -> usize {
+        self.leds.leds.len()
+    }
+
+    /// Bytes of program held, so a silent device can say whether it ever got
+    /// one.
+    pub fn program_bytes(&self) -> usize {
+        self.program_len
+    }
+
+    /// Sources admitted, for the same reason.
+    pub fn source_count(&self) -> usize {
+        self.stack.active().len()
+    }
+
+    /// Device time to show time.
+    pub fn show_time(&self, now_us: u64) -> u64 {
+        now_us.saturating_add_signed(self.clock_offset_us)
+    }
+
+    /// Take one datagram off the wire.
+    pub fn receive(&mut self, bytes: &[u8], now_us: u64) -> Handled {
+        let Ok(dg) = Datagram::decode(bytes) else {
+            return Handled::Undecodable;
+        };
+        // Answerable from the header alone, which is exactly why the header is
+        // not encrypted: a device on a shared network drops somebody else's
+        // mesh without decrypting anything.
+        if dg.header.mesh_prefix != self.mesh_prefix {
+            return Handled::NotForThisMesh;
+        }
+        let Ok(Some(payload)) = dg.parse_payload() else {
+            return Handled::Undecodable;
+        };
+
+        match payload {
+            Payload::Tick(tick) => {
+                let offset = dg.header.show_time_us as i64 - now_us as i64;
+                self.clock_offset_us = offset;
+                let _ = tick;
+                Handled::ClockSet { offset_us: offset }
+            }
+
+            Payload::ProgBegin(begin) => {
+                if begin.total_len as usize > MAX_PROGRAM {
+                    return Handled::ProgramRejected;
+                }
+                self.expected_len = begin.total_len as usize;
+                self.program_len = 0;
+                self.receiving = true;
+                Handled::ProgramStarted {
+                    len: begin.total_len,
+                }
+            }
+
+            Payload::ProgChunk(chunk) => {
+                if !self.receiving {
+                    return Handled::Ignored;
+                }
+                let at = chunk.offset as usize;
+                let end = at + chunk.data.len();
+                if end > self.expected_len || end > MAX_PROGRAM {
+                    // A chunk outside the length the sender declared is either a
+                    // corrupt transfer or a different program's chunk arriving
+                    // late. Either way, writing it would scribble on the buffer.
+                    self.receiving = false;
+                    return Handled::ProgramRejected;
+                }
+                self.program[at..end].copy_from_slice(chunk.data);
+                self.program_len = self.program_len.max(end);
+                Handled::ProgramChunk {
+                    at: chunk.offset,
+                    len: chunk.data.len(),
+                }
+            }
+
+            Payload::ProgEnd(_) => {
+                if !self.receiving || self.program_len != self.expected_len {
+                    self.receiving = false;
+                    return Handled::ProgramRejected;
+                }
+                self.receiving = false;
+                // Parsed once, here, rather than every frame. The answer cannot
+                // change, and re-parsing at 30 Hz is a measurable slice of a
+                // frame spent proving something already known.
+                match Program::parse(&self.program[..self.program_len]) {
+                    Ok(p) => Handled::ProgramComplete {
+                        len: self.program_len,
+                        budget: p.budget,
+                    },
+                    Err(_) => {
+                        self.program_len = 0;
+                        Handled::ProgramRejected
+                    }
+                }
+            }
+
+            Payload::SrcPush(push) => {
+                let source = Source {
+                    id: push.source_id,
+                    zone: self.zone.id,
+                    scene: push.scene_id,
+                    priority: push.priority,
+                    expires_at_us: push.expires_at,
+                    fade_in_ms: push.fade_in_ms,
+                    fade_out_ms: push.fade_out_ms,
+                    pushed_at_us: self.show_time(now_us),
+                    cost: 10,
+                };
+                match self
+                    .stack
+                    .push(self.show_time(now_us), source, &mut Vec::new())
+                {
+                    Ok(()) => {
+                        self.rendering = true;
+                        Handled::SourcePushed {
+                            priority: push.priority,
+                        }
+                    }
+                    Err(_) => Handled::SourceRejected,
+                }
+            }
+
+            Payload::SrcPop(pop) => {
+                self.stack
+                    .pop(self.show_time(now_us), pop.source_id, &mut Vec::new());
+                Handled::SourcePopped
+            }
+
+            _ => Handled::Ignored,
+        }
+    }
+
+    /// Render one frame into `out`, three bytes per LED.
+    ///
+    /// Returns the budget units spent, or `None` if there was nothing to render.
+    /// `out` is left alone in that case rather than blacked: a device with no
+    /// source keeps showing what it was showing, which is what makes an ambient
+    /// floor a floor rather than a special case.
+    pub fn render(&mut self, now_us: u64, out: &mut [u8]) -> Option<u32> {
+        if self.program_len == 0 {
+            return None;
+        }
+        let program = Program::parse(&self.program[..self.program_len]).ok()?;
+        let show_us = self.show_time(now_us);
+        let t = Q16::from_micros(show_us);
+
+        let mut frame = vec![Rgb::BLACK; self.leds.leds.len()];
+        let bound = [Bound {
+            source: *self.stack.active().first()?,
+            program: &program,
+            membership: &self.membership,
+            projection: self.zone.projection,
+        }];
+        let report = self.renderer.render_shard(
+            show_us,
+            t,
+            &self.leds,
+            &self.stack,
+            &bound,
+            &mut NoUniforms,
+            &mut frame,
+            Shard::whole(self.leds.leds.len() as u16),
+        );
+
+        for (i, px) in frame.iter().enumerate() {
+            out[i * 3] = to_byte(px.r);
+            out[i * 3 + 1] = to_byte(px.g);
+            out[i * 3 + 2] = to_byte(px.b);
+        }
+        Some(report.spent)
+    }
+
+    /// Drop sources whose expiry has passed.
+    ///
+    /// Called every frame. Expiry is absolute show time, so it happens at the
+    /// same instant on every device rather than whenever each one got the push.
+    pub fn advance(&mut self, now_us: u64) {
+        self.stack
+            .advance(self.show_time(now_us), &mut Vec::new());
+        self.rendering = !self.stack.active().is_empty();
+    }
+}
+
+/// Q16 0..1 to a byte, clamped.
+///
+/// Saturating rather than wrapping. An effect that overshoots should be as
+/// bright as the LED goes, not wrap round to dark - a highlight turning into a
+/// black spot is the kind of artefact that gets blamed on the strip.
+fn to_byte(v: Q16) -> u8 {
+    let clamped = v.0.clamp(0, Q16::ONE.0);
+    ((clamped * 255) >> 16) as u8
+}

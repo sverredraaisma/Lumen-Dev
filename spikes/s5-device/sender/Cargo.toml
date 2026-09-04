@@ -1,0 +1,17 @@
+[package]
+name = "s5-sender"
+description = "The other end of Spike S5: compiles an effect and pushes it to a device over the real wire protocol"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+lumen-proto = { path = "../../../../lumen-core/crates/lumen-proto" }
+lumen-lang = { path = "../../../../lumen-core/crates/lumen-lang" }
+# The same render loop the device runs, so `--simulate` and the strip cannot
+# disagree about what an effect looks like. A preview that renders by a
+# different route is a preview that can be wrong in the one way that matters.
+lumen-device = { path = "../../../../lumen-device/crates/lumen-device" }
+lumen-vm = { path = "../../../../lumen-core/crates/lumen-vm" }
+
+[workspace]

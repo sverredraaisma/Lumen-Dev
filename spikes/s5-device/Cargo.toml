@@ -1,0 +1,41 @@
+[package]
+name = "s5-device"
+description = "Spike S5: a whole device - strip output, then the network and the render loop above it"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "s5-device"
+path = "src/main.rs"
+
+[dependencies]
+esp-hal = { version = "0.23", features = ["esp32c3"] }
+esp-println = { version = "0.13", default-features = false, features = ["esp32c3", "jtag-serial", "log"] }
+log = "0.4"
+# For holding off interrupts across a strip frame - see the note in strip.rs.
+critical-section = "1.2"
+esp-backtrace = { version = "0.15", features = ["esp32c3", "println", "panic-handler"] }
+esp-alloc = "0.6"
+# `esp-alloc` is a default feature and must stay on: it provides
+# `esp_wifi_allocate_from_internal_ram`, which the driver's C blobs call.
+esp-wifi = { version = "0.12", default-features = false, features = [
+  "esp32c3", "wifi", "smoltcp", "utils", "esp-alloc", "log",
+] }
+smoltcp = { version = "0.12", default-features = false, features = [
+  "medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-udp", "socket-dhcpv4",
+] }
+
+# The real device core and the real VM, not a copy of either. If a pixel comes
+# out wrong here, something that ships is wrong.
+lumen-device = { path = "../../../lumen-device/crates/lumen-device" }
+lumen-proto = { path = "../../../lumen-core/crates/lumen-proto" }
+lumen-vm = { path = "../../../lumen-core/crates/lumen-vm", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = 2
+
+[workspace]

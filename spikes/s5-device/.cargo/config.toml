@@ -1,0 +1,15 @@
+[build]
+target = "riscv32imc-unknown-none-elf"
+
+[target.riscv32imc-unknown-none-elf]
+runner = "espflash flash --monitor"
+rustflags = [
+  # esp-hal ships the vector table and memory layout in this script. Without it
+  # the link fails on every `interruptN` symbol, which is what an ESP32 build
+  # looks like when the linker script has been forgotten.
+  "-C", "link-arg=-Tlinkall.x",
+  "-C", "force-frame-pointers",
+]
+
+[env]
+ESP_LOG = "info"

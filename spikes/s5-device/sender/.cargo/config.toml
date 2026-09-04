@@ -1,0 +1,5 @@
+# The device crate one directory up targets a RISC-V chip, and cargo inherits
+# config from parent directories. Without this the sender - which runs on a
+# desktop - would be built for the ESP32 and fail to find `std`.
+[build]
+target = "x86_64-pc-windows-msvc"

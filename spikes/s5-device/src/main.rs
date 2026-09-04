@@ -1,0 +1,449 @@
+//! Spike S5: a whole Lumen device, on real hardware, driving real light.
+//!
+//! Everything measured so far was measured with the output thrown away — the
+//! VM's throughput, the sync offsets, the multicast loss, the dual-core split.
+//! This is the stage where the pieces are wired to each other and to a strip,
+//! and a person can look at it.
+//!
+//! # What it is
+//!
+//! WiFi, a UDP socket, and the **real** device core above them: programs
+//! arriving as `ProgBegin`/`ProgChunk`/`ProgEnd`, a `SrcPush` putting one on the
+//! source stack, `lumen_device::Renderer` rendering it through the real VM and
+//! the real zone projection, and the result going out of the RMT peripheral to
+//! thirty SK6812 RGBW LEDs on GPIO4.
+//!
+//! Nothing along that path is a stand-in. If a pixel is wrong, something that
+//! ships is wrong — which is the whole reason to build it this way rather than
+//! mock the halves that are inconvenient.
+//!
+//! # Two stages, and stage 1 is still in here
+//!
+//! `LUMEN_STAGE=strip` runs the self-test from stage 1 and never touches the
+//! radio: one pixel walking the strip, then colour blocks, then white, then a
+//! gradient. It is how the strip, the pin, the LED count and the colour order
+//! were confirmed before anything harder was stacked on top, and it stays
+//! because it is the first thing to re-run when the light looks wrong.
+//!
+//! Anything else runs the device.
+//!
+//! # It announces itself
+//!
+//! The device broadcasts a one-byte hello. A sender hears it, learns the
+//! address, and sends **unicast** from then on: Spike S3 measured 4-6% loss on
+//! multicast over this AP against 0.00% on unicast, and a program transfer that
+//! loses a chunk is a program that never renders.
+//!
+//! It keeps announcing after it has been given something, once every five
+//! seconds instead of every one. Stopping was tried first and is wrong: a
+//! second sender can then never find a device that is already rendering, which
+//! means the only way to change the effect is to reboot the device.
+
+#![no_std]
+#![no_main]
+
+extern crate alloc;
+
+mod node;
+mod strip;
+
+use esp_backtrace as _;
+use esp_hal::clock::CpuClock;
+use esp_hal::rmt::Rmt;
+use esp_hal::rng::Rng;
+use esp_hal::time::RateExtU32;
+use esp_hal::timer::timg::TimerGroup;
+use esp_println::println;
+
+use esp_wifi::wifi::{ClientConfiguration, Configuration, WifiDevice, WifiStaDevice};
+use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
+use smoltcp::socket::{dhcpv4, udp};
+use smoltcp::time::Instant;
+use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address};
+
+use lumen_proto::Uuid;
+use node::{Handled, Node};
+use strip::{buffer_words, Format, Strip};
+
+/// Credentials come from the environment at build time, so they are never in
+/// the repository. Build with:
+///
+/// ```text
+/// LUMEN_WIFI_SSID='...' LUMEN_WIFI_PASS='...' cargo build --release
+/// ```
+const SSID: &str = env!("LUMEN_WIFI_SSID");
+const PASS: &str = env!("LUMEN_WIFI_PASS");
+
+/// `strip` runs the stage-1 self-test with no radio at all.
+const STAGE: &str = env!("LUMEN_STAGE");
+
+/// LEDs on the strip, and the pin they are on.
+const LEDS: usize = 30;
+
+/// SK6812 RGBW: 32 bits per LED, with a dedicated white die.
+///
+/// The white byte is sent as zero and white is mixed from the colour dies -
+/// see the note in `strip.rs`. It costs brightness and buys every device in the
+/// mesh agreeing about what a colour is.
+const FORMAT: Format = Format::Grbw;
+
+const SCRATCH: usize = buffer_words(LEDS, 4);
+
+/// The port a Lumen device listens on. Same as S3 used, so the two spikes can
+/// share a network without confusing each other's captures.
+const PORT: u16 = 6354;
+
+/// Which mesh this device belongs to. A device drops anything with a different
+/// prefix from the header alone, without decrypting.
+const MESH_PREFIX: [u8; 2] = [0x4c, 0x4d];
+
+/// Two bytes: "a Lumen device is here", and whether it already holds a program.
+///
+/// The second byte is what makes the test repeatable. A device that reboots -
+/// or is reflashed mid-transfer, which is how this was found - comes back with
+/// nothing, and a sender that had already sent its program would never send it
+/// again. Saying so costs one byte and turns "sometimes the strip stays dark"
+/// into a state machine.
+///
+/// Not a protocol message. Real discovery is mDNS, which is I/O, and this spike
+/// is not about discovery.
+const HELLO: u8 = 0xA5;
+const HELLO_INTERVAL_US: u64 = 1_000_000;
+
+/// Frame period. 30 fps for a first light - the C3 has headroom for 60 at 30
+/// LEDs, and a slower frame makes a stutter easier to see by eye.
+const FRAME_US: u64 = 33_333;
+
+fn now_us() -> u64 {
+    esp_hal::time::now().duration_since_epoch().to_micros()
+}
+
+fn set(pixels: &mut [u8], i: usize, r: u8, g: u8, b: u8) {
+    pixels[i * 3] = r;
+    pixels[i * 3 + 1] = g;
+    pixels[i * 3 + 2] = b;
+}
+
+/// Stage 1: prove the strip with no network in the way.
+fn strip_self_test<C: esp_hal::rmt::TxChannel>(
+    led_strip: &mut Strip<C>,
+    pixels: &mut [u8],
+    scratch: &mut [u32],
+    delay: &esp_hal::delay::Delay,
+) -> ! {
+    loop {
+        println!();
+        println!("== S5 stage 1: strip self-test, {LEDS} LEDs, {}", FORMAT.name());
+
+        println!("1. one white pixel walking 0 -> {}", LEDS - 1);
+        for i in 0..LEDS {
+            pixels.fill(0);
+            // Dim on purpose: thirty of these at full white is about 1.8 A, and
+            // a USB supply answering that with a brownout looks exactly like a
+            // driver that cannot hold a frame.
+            set(pixels, i, 40, 40, 40);
+            let _ = led_strip.write(pixels, scratch);
+            delay.delay_millis(120);
+        }
+
+        println!("2. ten red, ten green, ten blue - red nearest the controller");
+        for i in 0..LEDS {
+            match i / 10 {
+                0 => set(pixels, i, 60, 0, 0),
+                1 => set(pixels, i, 0, 60, 0),
+                _ => set(pixels, i, 0, 0, 60),
+            }
+        }
+        let _ = led_strip.write(pixels, scratch);
+        delay.delay_millis(4_000);
+
+        println!("3. every LED dim white, mixed from the colour dies");
+        for i in 0..LEDS {
+            set(pixels, i, 30, 30, 30);
+        }
+        let _ = led_strip.write(pixels, scratch);
+        delay.delay_millis(4_000);
+
+        println!("4. a red-to-blue gradient");
+        for i in 0..LEDS {
+            let t = (i * 255 / (LEDS - 1)) as u8;
+            set(pixels, i, 60 - t / 5, 0, t / 4);
+        }
+        let _ = led_strip.write(pixels, scratch);
+        delay.delay_millis(4_000);
+
+        pixels.fill(0);
+        let _ = led_strip.write(pixels, scratch);
+        delay.delay_millis(2_000);
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn device_loop<C: esp_hal::rmt::TxChannel>(
+    mut controller: esp_wifi::wifi::WifiController<'_>,
+    device: WifiDevice<'_, WifiStaDevice>,
+    mac: [u8; 6],
+    led_strip: &mut Strip<C>,
+    pixels: &mut [u8],
+    scratch: &mut [u32],
+) -> ! {
+    let mut device = device;
+
+    controller
+        .set_configuration(&Configuration::Client(ClientConfiguration {
+            ssid: SSID.try_into().expect("ssid fits"),
+            password: PASS.try_into().expect("password fits"),
+            ..Default::default()
+        }))
+        .expect("configure");
+    controller.start().expect("start wifi");
+    println!("== connecting to {SSID}");
+
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        if let Err(e) = controller.connect() {
+            println!("== connect() attempt {attempt}: {e:?}");
+        }
+        let until = now_us() + 8_000_000;
+        while now_us() < until {
+            if matches!(controller.is_connected(), Ok(true)) {
+                break;
+            }
+        }
+        if matches!(controller.is_connected(), Ok(true)) {
+            println!("== associated after {attempt} attempt(s)");
+            break;
+        }
+        println!("== not associated after attempt {attempt}; retrying");
+    }
+
+    // Power save off, and **after** association - S1 found it worth 4x on sync
+    // and S3 found setting it before `connect` did not survive. A device holding
+    // a shared clock cannot sleep between beacons, and that belongs in the power
+    // budget rather than being discovered later.
+    if let Err(e) = controller.set_power_saving(esp_wifi::config::PowerSaveMode::None) {
+        println!("== could not disable power save: {e:?}");
+    }
+
+    let config = Config::new(EthernetAddress::from_bytes(&mac).into());
+    let mut iface = Interface::new(config, &mut device, Instant::from_micros(now_us() as i64));
+
+    let mut sockets_storage = [SocketStorage::EMPTY; 3];
+    let mut sockets = SocketSet::new(&mut sockets_storage[..]);
+    let dhcp = sockets.add(dhcpv4::Socket::new());
+
+    let mut rx_meta = [udp::PacketMetadata::EMPTY; 32];
+    let mut rx_buf = [0u8; 8192];
+    let mut tx_meta = [udp::PacketMetadata::EMPTY; 8];
+    let mut tx_buf = [0u8; 1024];
+    let mut socket = udp::Socket::new(
+        udp::PacketBuffer::new(&mut rx_meta[..], &mut rx_buf[..]),
+        udp::PacketBuffer::new(&mut tx_meta[..], &mut tx_buf[..]),
+    );
+    socket.bind(PORT).expect("bind");
+    let udp_handle = sockets.add(socket);
+
+    // The device's identity. Derived from the MAC so it is stable across
+    // reboots and different on every board - a real device would have this
+    // provisioned, and two devices sharing a UUID is the kind of thing that
+    // only shows up when the second one is plugged in.
+    let mut id = [0u8; 16];
+    id[..6].copy_from_slice(&mac);
+    let mut lumen = Node::new(MESH_PREFIX, Uuid(id), LEDS as u16);
+
+    println!("== waiting for a lease");
+    let mut have_lease = false;
+    let mut next_hello_us = 0u64;
+    let mut next_frame_us = 0u64;
+    let mut frames: u32 = 0;
+    let mut spent_total: u64 = 0;
+    let mut next_report_us = 0u64;
+    let mut announced = false;
+    let mut datagrams: u32 = 0;
+    let mut program_bytes = 0usize;
+    let mut sources = 0usize;
+
+    loop {
+        iface.poll(
+            Instant::from_micros(now_us() as i64),
+            &mut device,
+            &mut sockets,
+        );
+
+        if !have_lease {
+            if let Some(dhcpv4::Event::Configured(cfg)) =
+                sockets.get_mut::<dhcpv4::Socket>(dhcp).poll()
+            {
+                iface.update_ip_addrs(|addrs| {
+                    addrs.clear();
+                    let _ = addrs.push(IpCidr::Ipv4(cfg.address));
+                });
+                if let Some(router) = cfg.router {
+                    let _ = iface.routes_mut().add_default_ipv4_route(router);
+                }
+                println!("== lease: {}", cfg.address);
+                println!("== listening on {PORT}, {LEDS} LEDs, mesh {MESH_PREFIX:02x?}");
+                have_lease = true;
+                next_frame_us = now_us();
+                next_report_us = now_us() + 5_000_000;
+            }
+            continue;
+        }
+
+        // Say where we are, always. A sender hears this, learns the address,
+        // and unicasts from then on - which is what S3 measured at 0.00% loss
+        // against multicast's 4-6%.
+        //
+        // Backing off rather than stopping once something has arrived. Stopping
+        // was the first version and it means a device that is already rendering
+        // can never be found again, so changing the effect needs a reboot.
+        let t = now_us();
+        if t >= next_hello_us {
+            let socket = sockets.get_mut::<udp::Socket>(udp_handle);
+            let to = IpEndpoint {
+                addr: IpAddress::Ipv4(Ipv4Address::new(255, 255, 255, 255)),
+                port: PORT,
+            };
+            let _ = socket.send_slice(&[HELLO, u8::from(lumen.program_bytes() > 0)], to);
+            next_hello_us = t + if announced {
+                HELLO_INTERVAL_US * 5
+            } else {
+                HELLO_INTERVAL_US
+            };
+        }
+
+        {
+            let socket = sockets.get_mut::<udp::Socket>(udp_handle);
+            let mut buf = [0u8; 1500];
+            while let Ok((n, _meta)) = socket.recv_slice(&mut buf) {
+                if buf[0] == HELLO && n <= 2 {
+                    // Another device announcing itself. Not ours to answer.
+                    continue;
+                }
+                datagrams += 1;
+                let handled = lumen.receive(&buf[..n], now_us());
+                match handled {
+                    // Logged, because these are the ones worth seeing once. The
+                    // per-chunk and per-frame cases are not: printing from the
+                    // receive loop at 30 Hz measures `println!`.
+                    Handled::ProgramStarted { len } => {
+                        println!("== program arriving, {len} bytes");
+                        announced = true;
+                    }
+                    Handled::ProgramComplete { len, budget } => {
+                        println!("== program complete: {len} bytes, {budget} units/pixel");
+                    }
+                    Handled::ProgramRejected => println!("== program rejected"),
+                    Handled::SourcePushed { priority } => {
+                        println!("== source pushed at priority {priority}");
+                    }
+                    Handled::SourceRejected => println!("== source rejected"),
+                    Handled::SourcePopped => println!("== source popped"),
+                    Handled::ClockSet { offset_us } => {
+                        // Only the first. A Tick arrives every second, and a
+                        // line per Tick is both noise and pressure on a serial
+                        // FIFO that a detached host stops draining.
+                        if !announced {
+                            println!("== show clock set, offset {offset_us} us");
+                        }
+                        announced = true;
+                    }
+                    Handled::Undecodable => println!("== undecodable datagram"),
+                    Handled::NotForThisMesh | Handled::Ignored | Handled::ProgramChunk { .. } => {}
+                }
+            }
+        }
+
+        let t = now_us();
+        if t >= next_frame_us {
+            // Absolute rather than `t + FRAME_US`, so a slow frame does not push
+            // every later one late. A show clock that drifts because rendering
+            // was briefly slow is a show clock that no longer agrees with the
+            // rest of the mesh.
+            next_frame_us += FRAME_US;
+            if next_frame_us < t {
+                next_frame_us = t + FRAME_US;
+            }
+
+            lumen.advance(t);
+            program_bytes = lumen.program_bytes();
+            sources = lumen.source_count();
+            if let Some(spent) = lumen.render(t, pixels) {
+                spent_total += spent as u64;
+                frames += 1;
+                if led_strip.write(pixels, scratch).is_err() {
+                    println!("== RMT transmission failed");
+                }
+            }
+        }
+
+        if t >= next_report_us {
+            next_report_us = t + 5_000_000;
+            // Printed every five seconds unconditionally. Silence is the one
+            // output that cannot be diagnosed: a device that has hung and a
+            // device with nothing to say look identical down a serial cable.
+            if frames > 0 {
+                println!(
+                    "== {frames} frames in 5 s ({} fps), {} units/frame, {datagrams} datagrams",
+                    frames / 5,
+                    spent_total / frames as u64
+                );
+            } else {
+                println!(
+                    "== idle: {} bytes of program, {} source(s), {datagrams} datagrams",
+                    program_bytes, sources
+                );
+            }
+            frames = 0;
+            spent_total = 0;
+        }
+    }
+}
+
+#[esp_hal::main]
+fn main() -> ! {
+    let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
+    let peripherals = esp_hal::init(config);
+    let delay = esp_hal::delay::Delay::new();
+
+    let rmt = Rmt::new(peripherals.RMT, strip::CLOCK_MHZ.MHz()).expect("RMT");
+    let mut led_strip =
+        Strip::new(rmt.channel0, peripherals.GPIO4, FORMAT).expect("a channel on GPIO4");
+    let mut pixels = [0u8; LEDS * 3];
+    let mut scratch = [0u32; SCRATCH];
+
+    if STAGE == "strip" {
+        strip_self_test(&mut led_strip, &mut pixels, &mut scratch, &delay);
+    }
+
+    // The render loop allocates - a membership is a `Vec`, the machines live in
+    // a `BTreeMap` - and so does esp-wifi. 96 KiB leaves room for both on a
+    // chip with about 400.
+    esp_alloc::heap_allocator!(96 * 1024);
+
+    let timg0 = TimerGroup::new(peripherals.TIMG0);
+    let init = esp_wifi::init(
+        timg0.timer0,
+        Rng::new(peripherals.RNG),
+        peripherals.RADIO_CLK,
+    )
+    .expect("esp-wifi");
+    let (wifi_device, controller) =
+        esp_wifi::wifi::new_with_mode(&init, peripherals.WIFI, WifiStaDevice).expect("sta");
+    let mut mac = [0u8; 6];
+    esp_wifi::wifi::sta_mac(&mut mac);
+
+    println!();
+    println!("== spike S5: a Lumen device");
+    println!("== {LEDS} SK6812 RGBW on GPIO4, {}", FORMAT.name());
+
+    device_loop(
+        controller,
+        wifi_device,
+        mac,
+        &mut led_strip,
+        &mut pixels,
+        &mut scratch,
+    )
+}

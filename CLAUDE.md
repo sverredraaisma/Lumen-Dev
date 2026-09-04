@@ -99,6 +99,7 @@ Three assumptions carry the architecture, and all three need real hardware:
 | S2 | Bytecode interpreter in Rust, per-pixel, 300 LEDs | 60 fps with ≥1000 instructions/pixel headroom on an S3 | **conditional pass, now on the S3 too** |
 | S3 | Multicast CHAN at 60 Hz to 10+ devices on a consumer AP | Loss under 1%, jitter under a frame | **multicast fails, unicast passes on loss** |
 | S4 | Splitting the pixel loop across an S3's two cores | Faster, and byte-identical to one core | **passes: 2.1×, identical** |
+| S5 | A whole device: WiFi, the protocol, the render loop, a real strip | A program written on a desktop lights real LEDs | **passes: 30 fps on a C3** |
 
 **S2 ran on a C3 and passed on the thing that mattered, not on its own
 criterion.** Every corpus effect renders 300 pixels inside a 60 fps frame, the
@@ -187,6 +188,35 @@ faulted `07-alert` every frame so it rendered nothing; and it looked an LED up
 with a linear scan **per pixel**, quadratic in the strip and worth 20-25% of
 every frame. Both were free in every host test, because every host test is four
 LEDs long.
+
+## The first light
+
+**S5 is the first thing in this project anybody can look at.** Every number
+before it - VM throughput, sync offsets, multicast loss, the dual-core split -
+was measured with the output thrown away. `spikes/s5-device/` is the whole chain
+with nothing stubbed: an effect compiled on a desktop, sent as
+`ProgBegin`/`ProgChunk`/`ProgEnd`, admitted to the source stack, rendered by the
+real `Renderer` through the real VM, and driven out of RMT to 30 SK6812 RGBW
+LEDs. It runs at 30 fps on a C3.
+
+It found five bugs, three of them in shipping code, and the first one is the
+lesson: **`dt` compiled to the same register as `t`**, so it was the absolute
+show time. Nothing failed - `pow(decay, dt * 60)` saturated, trails never
+decayed, and the strip filled with stuck pixels. 250 host tests said nothing,
+because the wrongness only shows across frames on a device. The others: the
+frame budget was reported for one pixel rather than the whole strip; WiFi
+interrupts corrupted every RMT frame; and show time both saturated Q16 and lost
+its sub-second part to a `u32` overflow.
+
+Two things it surfaced and did **not** fix, both recorded in
+`spikes/s5-device/RESULTS.md`: there is **no output stage** anywhere in the
+project, so linear values go straight to the LEDs and the dark end of every fade
+collapses; and holding interrupts off across an RMT frame is a stopgap that does
+not scale past about 30 LEDs - DMA is the follow-up.
+
+`sender --simulate` renders on the host through the *same* `lumen-device`
+renderer the firmware runs. Reach for it before reaching for hardware: if the
+ramp is right and the strip is wrong, the fault is below the renderer.
 
 ## Compact instructions
 

@@ -46,7 +46,7 @@ effect "canary" {
         let program =
             Program::parse(&compiled.bytecode).expect("the emitter produced a bad program");
         let mut m = Machine::new();
-        m.run_frame_at(&program, Q16::from_ratio(1, 4), &mut NoUniforms)
+        m.run_frame_at(&program, Q16::from_ratio(1, 4), Q16::ZERO, &mut NoUniforms)
             .unwrap();
         let out = m
             .run_pixel(
