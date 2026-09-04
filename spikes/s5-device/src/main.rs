@@ -46,6 +46,7 @@ extern crate alloc;
 
 mod node;
 mod strip;
+mod strip_dma;
 
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
@@ -64,6 +65,7 @@ use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address}
 use lumen_proto::Uuid;
 use node::{Handled, Node};
 use strip::{buffer_words, Format, Strip};
+use strip_dma::DmaStrip;
 
 /// Credentials come from the environment at build time, so they are never in
 /// the repository. Build with:
@@ -76,6 +78,14 @@ const PASS: &str = env!("LUMEN_WIFI_PASS");
 
 /// `strip` runs the stage-1 self-test with no radio at all.
 const STAGE: &str = env!("LUMEN_STAGE");
+
+/// `rmt` drives the strip from RMT with interrupts held off for the frame;
+/// anything else uses SPI with DMA.
+///
+/// Both are kept because the comparison is the point: RMT needed a critical
+/// section to survive WiFi at all, and how much that costs is a number this
+/// spike should be able to produce rather than assert.
+const DRIVER: &str = env!("LUMEN_DRIVER");
 
 /// LEDs on the strip, and the pin they are on.
 const LEDS: usize = 30;
@@ -178,14 +188,37 @@ fn strip_self_test<C: esp_hal::rmt::TxChannel>(
     }
 }
 
+/// Whatever this device pushes bytes out of.
+trait StripOut {
+    fn show(&mut self, pixels: &[u8]) -> Result<(), ()>;
+    fn name(&self) -> &'static str;
+}
+
+impl<C: esp_hal::rmt::TxChannel> StripOut for (Strip<C>, &mut [u32]) {
+    fn show(&mut self, pixels: &[u8]) -> Result<(), ()> {
+        self.0.write(pixels, self.1).map_err(|_| ())
+    }
+    fn name(&self) -> &'static str {
+        "RMT, interrupts held off for the frame"
+    }
+}
+
+impl StripOut for (DmaStrip<'_>, &mut [u8]) {
+    fn show(&mut self, pixels: &[u8]) -> Result<(), ()> {
+        self.0.write(pixels, self.1)
+    }
+    fn name(&self) -> &'static str {
+        "SPI with DMA"
+    }
+}
+
 #[allow(clippy::too_many_lines)]
-fn device_loop<C: esp_hal::rmt::TxChannel>(
+fn device_loop(
     mut controller: esp_wifi::wifi::WifiController<'_>,
     device: WifiDevice<'_, WifiStaDevice>,
     mac: [u8; 6],
-    led_strip: &mut Strip<C>,
+    led_strip: &mut dyn StripOut,
     pixels: &mut [u8],
-    scratch: &mut [u32],
 ) -> ! {
     let mut device = device;
 
@@ -263,6 +296,10 @@ fn device_loop<C: esp_hal::rmt::TxChannel>(
     let mut datagrams: u32 = 0;
     let mut program_bytes = 0usize;
     let mut sources = 0usize;
+    let mut draw_ua = 0u32;
+    let mut render_us = 0u64;
+    let mut show_us = 0u64;
+    let mut derated = lumen_vm::q16::Q16::ONE;
 
     loop {
         iface.poll(
@@ -283,7 +320,10 @@ fn device_loop<C: esp_hal::rmt::TxChannel>(
                     let _ = iface.routes_mut().add_default_ipv4_route(router);
                 }
                 println!("== lease: {}", cfg.address);
-                println!("== listening on {PORT}, {LEDS} LEDs, mesh {MESH_PREFIX:02x?}");
+                println!(
+                "== listening on {PORT}, {LEDS} LEDs, mesh {MESH_PREFIX:02x?}, via {}",
+                led_strip.name()
+            );
                 have_lease = true;
                 next_frame_us = now_us();
                 next_report_us = now_us() + 5_000_000;
@@ -380,15 +420,25 @@ fn device_loop<C: esp_hal::rmt::TxChannel>(
                 next_frame_us = t + FRAME_US;
             }
 
+            let before = now_us();
             lumen.advance(t);
             program_bytes = lumen.program_bytes();
             sources = lumen.source_count();
-            if let Some(spent) = lumen.render(t, pixels) {
+            if let Some((spent, encoded)) = lumen.render(t, pixels) {
                 spent_total += spent as u64;
+                draw_ua = encoded.draw_ua;
+                derated = encoded.derated_to;
                 frames += 1;
-                if led_strip.write(pixels, scratch).is_err() {
-                    println!("== RMT transmission failed");
+                let rendered = now_us();
+                if led_strip.show(pixels).is_err() {
+                    println!("== the strip driver refused a frame");
                 }
+                // Split, because the two halves scale completely differently:
+                // rendering is per pixel and the output is a fixed transfer at
+                // 1.25 us a bit. Which one a longer strip runs out of frame on
+                // is the question this spike should be able to answer.
+                render_us += rendered - before;
+                show_us += now_us() - rendered;
             }
         }
 
@@ -398,10 +448,22 @@ fn device_loop<C: esp_hal::rmt::TxChannel>(
             // output that cannot be diagnosed: a device that has hung and a
             // device with nothing to say look identical down a serial cable.
             if frames > 0 {
+                // The draw and the derating are reported because a strip that
+                // is quietly at 40% because the supply is too small looks
+                // exactly like an effect that is quietly wrong, and the two are
+                // debugged in completely different places.
                 println!(
-                    "== {frames} frames in 5 s ({} fps), {} units/frame, {datagrams} datagrams",
+                    "== {frames} frames in 5 s ({} fps), {} units/frame, {datagrams} datagrams, {} mA{}, render {} us, show {} us",
                     frames / 5,
-                    spent_total / frames as u64
+                    spent_total / frames as u64,
+                    draw_ua / 1000,
+                    if derated.0 < lumen_vm::q16::Q16::ONE.0 {
+                        " (derated)"
+                    } else {
+                        ""
+                    },
+                    render_us / frames as u64,
+                    show_us / frames as u64,
                 );
             } else {
                 println!(
@@ -411,6 +473,8 @@ fn device_loop<C: esp_hal::rmt::TxChannel>(
             }
             frames = 0;
             spent_total = 0;
+            render_us = 0;
+            show_us = 0;
         }
     }
 }
@@ -421,13 +485,16 @@ fn main() -> ! {
     let peripherals = esp_hal::init(config);
     let delay = esp_hal::delay::Delay::new();
 
-    let rmt = Rmt::new(peripherals.RMT, strip::CLOCK_MHZ.MHz()).expect("RMT");
-    let mut led_strip =
-        Strip::new(rmt.channel0, peripherals.GPIO4, FORMAT).expect("a channel on GPIO4");
     let mut pixels = [0u8; LEDS * 3];
     let mut scratch = [0u32; SCRATCH];
 
+    // The stage-1 self-test always runs on RMT: it exists to prove the strip
+    // with as little as possible between the pixel and the wire, and the radio
+    // is off, so the deadline RMT races is one nothing is competing for.
     if STAGE == "strip" {
+        let rmt = Rmt::new(peripherals.RMT, strip::CLOCK_MHZ.MHz()).expect("RMT");
+        let mut led_strip =
+            Strip::new(rmt.channel0, peripherals.GPIO4, FORMAT).expect("a channel on GPIO4");
         strip_self_test(&mut led_strip, &mut pixels, &mut scratch, &delay);
     }
 
@@ -452,12 +519,29 @@ fn main() -> ! {
     println!("== spike S5: a Lumen device");
     println!("== {LEDS} SK6812 RGBW on GPIO4, {}", FORMAT.name());
 
-    device_loop(
-        controller,
-        wifi_device,
-        mac,
-        &mut led_strip,
-        &mut pixels,
-        &mut scratch,
-    )
+    if DRIVER == "rmt" {
+        let rmt = Rmt::new(peripherals.RMT, strip::CLOCK_MHZ.MHz()).expect("RMT");
+        let led_strip =
+            Strip::new(rmt.channel0, peripherals.GPIO4, FORMAT).expect("a channel on GPIO4");
+        let mut out = (led_strip, &mut scratch[..]);
+        device_loop(controller, wifi_device, mac, &mut out, &mut pixels)
+    } else {
+        // Static, because the DMA engine reads this buffer while the CPU has
+        // moved on and a stack frame is exactly the wrong lifetime for that.
+        static mut DMA_SCRATCH: [u8; strip_dma::buffer_bytes(LEDS, 4)] =
+            [0; strip_dma::buffer_bytes(LEDS, 4)];
+        let (rx, tx) = strip_dma_buffers!(strip_dma::buffer_bytes(LEDS, 4));
+        let led_strip = DmaStrip::new(
+            peripherals.SPI2,
+            peripherals.DMA_CH0,
+            peripherals.GPIO4,
+            FORMAT,
+            rx,
+            tx,
+        )
+        .expect("SPI on GPIO4");
+        let scratch = unsafe { &mut *core::ptr::addr_of_mut!(DMA_SCRATCH) };
+        let mut out = (led_strip, &mut scratch[..]);
+        device_loop(controller, wifi_device, mac, &mut out, &mut pixels)
+    }
 }

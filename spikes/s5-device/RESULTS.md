@@ -77,9 +77,36 @@ of it every 24 words — about forty times for a 30-LED RGBW frame, each with a
 mid-frame, the strip takes the gap for a latch, and everything after it lands in
 the wrong LED.
 
-Holding interrupts off across the frame fixes it completely. That is a stopgap,
-not an answer: 30 LEDs is 1.2 ms, so 3.6% of the time at 30 fps, but 300 LEDs
-would be 12 ms — most of a frame. **DMA is the first follow-up.**
+Holding interrupts off across the frame fixes it completely, and is a stopgap:
+30 LEDs is 1.2 ms, so 3.6% of the time at 30 fps, but 300 LEDs would be 12 ms —
+most of a frame with the radio deaf.
+
+**Since fixed with SPI and DMA** (`strip_dma.rs`), selected by `LUMEN_DRIVER`.
+esp-hal 0.23's RMT has no DMA support, but a shift register clocking fixed-width
+bits is a perfectly good pulse generator: each LED bit becomes four SPI bits at
+3.2 MHz, so a zero is `1000` (312 ns high) and a one is `1100` (625 ns), both
+inside what an SK6812 accepts. Three bits at 2.4 MHz is the commonly seen choice
+and does *not* work here — it puts a one at 833 ns, out of spec. That kind of
+error does not fail on a bench; it fails on the twentieth LED of a long run.
+
+Measured, 30 LEDs, comet, both drivers on the same hardware:
+
+| | render | show |
+|---|---|---|
+| RMT, interrupts held off | 3 103 µs | 1 340 µs |
+| SPI + DMA, no critical section | 3 150 µs | 1 394 µs |
+
+**DMA is not faster, and was never going to be.** 30 LEDs × 32 bits × 1.25 µs is
+1.2 ms of wire time whatever drives it, and both land within 4% of that. What
+changes is what the CPU is doing during those 1.4 ms: RMT spends them refilling
+a 48-word buffer against a 30 µs deadline with interrupts disabled, and DMA
+spends them idle with the radio being serviced normally.
+
+The remaining win is not taken yet: with DMA the *next* frame can be rendered
+while the current one is still going out. At 30 LEDs that would save 1.4 ms of
+33; at 300 it would overlap 12 ms of wire time with 30 ms of rendering, which is
+where it starts to matter. `SpiDmaBus::write` blocks, so it needs the
+non-blocking transfer API and a second buffer.
 
 ### Show time saturated, then lost its fraction
 
@@ -95,6 +122,30 @@ The conversion existed twice — correctly in `lumen-capi` in `i64`, and wrongly
 here — so it is now one `Q16::from_micros` in the VM that both use. Show time
 counts from the start of the show; wall time travels in the `Tick`'s own field,
 which is where a device wanting a date should look.
+
+### No output stage existed — and it is not a gamma stage
+
+Recorded above as "no output stage", which was right, and diagnosed as a missing
+gamma curve, which was wrong.
+
+A WS2812-class LED's PWM is proportional to the light it emits and a Lumen colour
+is already linear light, so an sRGB curve on the way out would make every strip
+brighter than the effect asked for. The problem it gets reached for is real but
+it is **quantisation**: eight bits of linear PWM cannot represent anything below
+1/255, so the dark end of a fade arrives in a few visible steps and then stops
+early.
+
+`lumen_vm::output` now does the three things that were missing, and measured on
+this hardware:
+
+- **Power derating**, which every board declares a `max_current_ma` for and
+  nothing implemented. Thirty SK6812 at full white want about 1.2 A; against a
+  500 mA budget the stage lands the frame at **495–499 mA** and says it derated.
+  Scaled uniformly rather than clipped, so an over-budget frame dims instead of
+  losing its highlights and shifting colour.
+- **Temporal dithering**, deterministic so two devices showing one gradient stay
+  in step.
+- **Brightness**, which had nowhere to live.
 
 ### Nothing connected channels to the VM
 

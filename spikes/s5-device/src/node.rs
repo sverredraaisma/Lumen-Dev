@@ -26,6 +26,7 @@ use lumen_device::zones::{Clause, DeviceLeds, Led, MapQuality, Membership, Proje
 use lumen_device::Renderer;
 use lumen_proto::msg::Payload;
 use lumen_proto::{Datagram, Uuid};
+use lumen_vm::output::{Encoded, Output, PowerModel};
 use lumen_vm::program::Program;
 use lumen_vm::q16::Q16;
 
@@ -93,6 +94,14 @@ pub struct Node {
     /// Whether a source is currently admitted, so `main` can say so once rather
     /// than every frame.
     pub rendering: bool,
+
+    /// Linear light, before the output stage turns it into codes.
+    frame: Vec<Rgb>,
+    /// The output stage's dither state, one entry per channel, carried between
+    /// frames. Without it the dark end of every fade lands in four visible
+    /// steps and then stops early.
+    residual: Vec<i32>,
+    output: Output,
 }
 
 impl Node {
@@ -140,6 +149,14 @@ impl Node {
             receiving: false,
             clock_offset_us: 0,
             rendering: false,
+            frame: vec![Rgb::BLACK; count as usize],
+            residual: vec![0; count as usize * 3],
+            // A 500 mA budget, which is what a USB port promises without
+            // negotiating for more. Thirty of these at full white want about
+            // 1.2 A, so this strip *will* derate - which is the point: a board
+            // that browns out mid-frame looks exactly like a driver that cannot
+            // hold one.
+            output: Output::new().with_power(PowerModel::ws2812(500)),
         }
     }
 
@@ -348,7 +365,7 @@ impl Node {
     /// `out` is left alone in that case rather than blacked: a device with no
     /// source keeps showing what it was showing, which is what makes an ambient
     /// floor a floor rather than a special case.
-    pub fn render(&mut self, now_us: u64, out: &mut [u8]) -> Option<u32> {
+    pub fn render(&mut self, now_us: u64, out: &mut [u8]) -> Option<(u32, Encoded)> {
         if self.program_len == 0 {
             return None;
         }
@@ -356,7 +373,6 @@ impl Node {
         let show_us = self.show_time(now_us);
         let t = Q16::from_micros(show_us);
 
-        let mut frame = vec![Rgb::BLACK; self.leds.leds.len()];
         // The device's channels, seen as this program's uniforms. Without this
         // every channel read returns zero - which is exactly what a channel with
         // no producer correctly returns, so the mistake is invisible.
@@ -374,16 +390,26 @@ impl Node {
             &self.stack,
             &bound,
             &mut uniforms,
-            &mut frame,
+            &mut self.frame,
             Shard::whole(self.leds.leds.len() as u16),
         );
 
-        for (i, px) in frame.iter().enumerate() {
-            out[i * 3] = to_byte(px.r);
-            out[i * 3 + 1] = to_byte(px.g);
-            out[i * 3 + 2] = to_byte(px.b);
+        // Linear light through the output stage, which is where brightness, the
+        // power budget and the dithering live. Writing `(v * 255) >> 16` here
+        // instead - which is what this did - throws away everything below one
+        // code and lets the strip ask the supply for more than it has.
+        let mut linear = [Q16::ZERO; MAX_CHANNELS];
+        let n = (self.frame.len() * 3).min(MAX_CHANNELS);
+        for (i, px) in self.frame.iter().enumerate() {
+            if i * 3 + 2 >= n {
+                break;
+            }
+            linear[i * 3] = px.r;
+            linear[i * 3 + 1] = px.g;
+            linear[i * 3 + 2] = px.b;
         }
-        Some(report.spent)
+        let encoded = self.output.encode(&linear[..n], Some(&mut self.residual), out);
+        Some((report.spent, encoded))
     }
 
     /// Drop sources whose expiry has passed.
@@ -397,12 +423,6 @@ impl Node {
     }
 }
 
-/// Q16 0..1 to a byte, clamped.
-///
-/// Saturating rather than wrapping. An effect that overshoots should be as
-/// bright as the LED goes, not wrap round to dark - a highlight turning into a
-/// black spot is the kind of artefact that gets blamed on the strip.
-fn to_byte(v: Q16) -> u8 {
-    let clamped = v.0.clamp(0, Q16::ONE.0);
-    ((clamped * 255) >> 16) as u8
-}
+/// Channels the linear staging buffer holds. 300 LEDs, the size the project
+/// sizes against, so the same firmware drives a longer strip unchanged.
+const MAX_CHANNELS: usize = 900;
