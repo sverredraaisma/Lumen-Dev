@@ -19,6 +19,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
+use lumen_device::channels::{Channel, ChannelUniforms, Channels};
 use lumen_device::render::{Bound, Rgb, Shard};
 use lumen_device::sources::{Source, SourceStack};
 use lumen_device::zones::{Clause, DeviceLeds, Led, MapQuality, Membership, Projection, Zone};
@@ -27,7 +28,6 @@ use lumen_proto::msg::Payload;
 use lumen_proto::{Datagram, Uuid};
 use lumen_vm::program::Program;
 use lumen_vm::q16::Q16;
-use lumen_vm::vm::NoUniforms;
 
 /// Largest program this device will hold.
 ///
@@ -46,8 +46,15 @@ pub enum Handled {
     Undecodable,
     ProgramStarted { len: u32 },
     ProgramChunk { at: u32, len: usize },
-    ProgramComplete { len: usize, budget: u32 },
+    ProgramComplete {
+        len: usize,
+        budget: u32,
+        channels: usize,
+    },
     ProgramRejected,
+    ChannelClaimed { id: u16 },
+    ChannelSet { id: u16, value: i32 },
+    ChannelUnknown { id: u16 },
     SourcePushed { priority: u8 },
     SourcePopped,
     SourceRejected,
@@ -62,6 +69,13 @@ pub struct Node {
     membership: Membership,
     stack: SourceStack,
     renderer: Renderer,
+    /// Broadcast values an effect reads: a slider, a beat, a sensor.
+    ///
+    /// Declared from the program when one arrives, because the program's header
+    /// is what says which channels it reads - a device does not decide, it is
+    /// told, and that is what lets one effect be pointed at a different producer
+    /// without recompiling.
+    channels: Channels,
 
     /// The program being received, and the one being rendered. The same buffer:
     /// a device holds one program at a time here, and a half-received program
@@ -119,6 +133,7 @@ impl Node {
             // budget is per pixel.
             stack: SourceStack::new(100_000, 4),
             renderer: Renderer::new(),
+            channels: Channels::new(),
             program: vec![0; MAX_PROGRAM],
             program_len: 0,
             expected_len: 0,
@@ -214,14 +229,80 @@ impl Node {
                 // change, and re-parsing at 30 Hz is a measurable slice of a
                 // frame spent proving something already known.
                 match Program::parse(&self.program[..self.program_len]) {
-                    Ok(p) => Handled::ProgramComplete {
-                        len: self.program_len,
-                        budget: p.budget,
-                    },
+                    Ok(p) => {
+                        // Declare what this program reads. A channel nobody has
+                        // published to yet reads its default, so an effect is
+                        // never waiting on a producer before it will render.
+                        //
+                        // The hold is generous here: a slider on a phone sends
+                        // when a finger moves, and a finger that stops moving is
+                        // not a producer that has died.
+                        for slot in 0..p.channel_count() {
+                            if let Some(id) = p.channel_id(slot as u8) {
+                                self.channels.declare(Channel::new(id, 2_000, Q16::ZERO));
+                            }
+                        }
+                        Handled::ProgramComplete {
+                            len: self.program_len,
+                            budget: p.budget,
+                            channels: p.channel_count(),
+                        }
+                    }
                     Err(_) => {
                         self.program_len = 0;
                         Handled::ProgramRejected
                     }
+                }
+            }
+
+            Payload::ChanClaim(claim) => {
+                // Read the clock before taking the borrow: `show_time` needs
+                // `&self` and `get_mut` holds `&mut self`.
+                let now = self.show_time(now_us);
+                let Some(channel) = self.channels.get_mut(claim.channel_id) else {
+                    return Handled::ChannelUnknown {
+                        id: claim.channel_id,
+                    };
+                };
+                channel.claim(
+                    now,
+                    dg.header.sender_prefix,
+                    claim.priority,
+                    claim.lease_ms,
+                );
+                Handled::ChannelClaimed {
+                    id: claim.channel_id,
+                }
+            }
+
+            Payload::Chan(chan) => {
+                let now = self.show_time(now_us);
+                let Some(channel) = self.channels.get_mut(chan.channel_id) else {
+                    return Handled::ChannelUnknown {
+                        id: chan.channel_id,
+                    };
+                };
+                // One Q16 per channel. A multi-value producer sends one
+                // datagram per band rather than packing them, so a receiver
+                // that only reads band 3 is not decoding sixteen.
+                if chan.payload.len() < 4 {
+                    return Handled::Undecodable;
+                }
+                let raw = i32::from_le_bytes([
+                    chan.payload[0],
+                    chan.payload[1],
+                    chan.payload[2],
+                    chan.payload[3],
+                ]);
+                channel.publish(
+                    now,
+                    dg.header.sender_prefix,
+                    chan.producer_seq,
+                    Q16(raw),
+                );
+                Handled::ChannelSet {
+                    id: chan.channel_id,
+                    value: raw,
                 }
             }
 
@@ -276,6 +357,10 @@ impl Node {
         let t = Q16::from_micros(show_us);
 
         let mut frame = vec![Rgb::BLACK; self.leds.leds.len()];
+        // The device's channels, seen as this program's uniforms. Without this
+        // every channel read returns zero - which is exactly what a channel with
+        // no producer correctly returns, so the mistake is invisible.
+        let mut uniforms = ChannelUniforms::new(&self.channels, &program, show_us);
         let bound = [Bound {
             source: *self.stack.active().first()?,
             program: &program,
@@ -288,7 +373,7 @@ impl Node {
             &self.leds,
             &self.stack,
             &bound,
-            &mut NoUniforms,
+            &mut uniforms,
             &mut frame,
             Shard::whole(self.leds.leds.len() as u16),
         );

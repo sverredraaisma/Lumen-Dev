@@ -331,9 +331,23 @@ fn device_loop<C: esp_hal::rmt::TxChannel>(
                         println!("== program arriving, {len} bytes");
                         announced = true;
                     }
-                    Handled::ProgramComplete { len, budget } => {
-                        println!("== program complete: {len} bytes, {budget} units/pixel");
+                    Handled::ProgramComplete {
+                        len,
+                        budget,
+                        channels,
+                    } => {
+                        println!(
+                            "== program complete: {len} bytes, {budget} units/pixel, {channels} channel(s)"
+                        );
                     }
+                    Handled::ChannelClaimed { id } => println!("== channel {id} claimed"),
+                    Handled::ChannelUnknown { id } => {
+                        println!("== channel {id} is not one this program reads")
+                    }
+                    // Not logged: a slider sends these thirty times a second,
+                    // and a line each would measure `println!` rather than the
+                    // device.
+                    Handled::ChannelSet { .. } => {}
                     Handled::ProgramRejected => println!("== program rejected"),
                     Handled::SourcePushed { priority } => {
                         println!("== source pushed at priority {priority}");

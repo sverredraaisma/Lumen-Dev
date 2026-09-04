@@ -96,6 +96,35 @@ here — so it is now one `Q16::from_micros` in the VM that both use. Show time
 counts from the start of the show; wall time travels in the `Tick`'s own field,
 which is where a device wanting a date should look.
 
+### Nothing connected channels to the VM
+
+The device had a `Channels` store and the VM had a `Uniforms` trait, and there
+was nothing between them, so every `CHREAD` returned zero. Silent, because zero
+is also what a channel with no producer correctly returns: an effect reading a
+live slider and an effect reading nothing look identical on a strip.
+
+`lumen_device::channels::ChannelUniforms` now bridges them, and the realtime path
+is proven on hardware — `04-pulse` with its `audio` channel claimed and driven at
+30 Hz from a desktop, rendering at 30 fps on the C3.
+
+### A sender that blocked 500 ms per loop
+
+Driving that channel, the strip looked like it was running at about 1 fps. The
+device was not slow: it reported a rock-steady 30 fps throughout, of a value
+changing twice a second, because the sender's socket had a 500 ms read timeout
+and its loop could only publish twice a second whatever `DRIVE_HZ` said.
+
+**A perfectly smooth render of a staircase input is indistinguishable from a slow
+device by eye.** What made it a one-step diagnosis was the datagram counter in the
+device's five-second report — 20 per five seconds where there should have been
+160. Without that number the next move would have been profiling the C3, which
+was working perfectly.
+
+That is the third time in this spike the symptom pointed at the wrong layer, and
+all three were settled the same way: by instrumenting the boundary rather than
+the suspect. Frames against datagrams here, `0 bytes of program` for the dark
+strip, and `--simulate` for the missing tail.
+
 ## What it cost
 
 `dt` needed a register, so `R_SCRATCH` moved from 15 to 16 and the scratch file

@@ -29,7 +29,7 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use lumen_proto::header::{Header, MsgType, HEADER_LEN, TAG_LEN};
-use lumen_proto::msg::{ProgBegin, ProgChunk, ProgEnd, SrcPush, Tick};
+use lumen_proto::msg::{Chan, ChanClaim, ProgBegin, ProgChunk, ProgEnd, SrcPush, Tick};
 use lumen_proto::{Uuid, Writer};
 
 /// The port a device listens on, matching the spike's firmware.
@@ -49,6 +49,16 @@ const HELLO: u8 = 0xA5;
 /// lost fragment costs the whole datagram, which is the thing chunking exists
 /// to avoid.
 const CHUNK: usize = 1024;
+
+/// How often a driven channel is published.
+///
+/// Thirty, matching the device's frame rate. Faster would be spending bandwidth
+/// on values no frame will ever read; much slower and the channel's hold time
+/// starts deciding what the light does instead of the slider.
+const DRIVE_HZ: u32 = 30;
+
+/// How long one sweep of the driven value takes.
+const DRIVE_PERIOD_US: u64 = 4_000_000;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -133,6 +143,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // reflashed halfway through a transfer - which is how this loop came to
         // exist, because the fixed version sent the program once to a device
         // that then restarted and stayed dark.
+        // Back to a patient timeout while there is nothing to drive: spinning
+        // at 500 Hz to wait for a broadcast would burn a core for nothing.
+        socket.set_read_timeout(Some(Duration::from_millis(500)))?;
         let device = wait_for_needy_device(&socket)?;
         println!("
 device at {device} has no program; sending one");
@@ -196,10 +209,67 @@ device at {device} has no program; sending one");
         })?;
         println!("pushed at priority {priority}, expiring in {seconds} s");
 
+        // Claim the channels this program reads, so this sender is allowed to
+        // publish to them. A channel is owned: two producers fighting over one
+        // slider is the failure the claim exists to make impossible, and the
+        // higher priority wins outright rather than the two interleaving.
+        let channels = channel_ids(&bytecode);
+        for id in &channels {
+            send(&socket, device, MsgType::ChanClaim, &mut sequence, show_now(), |w| {
+                ChanClaim {
+                    channel_id: *id,
+                    priority: 100,
+                    // Renewed on the same clock the Ticks go out on. A lease
+                    // that outlives the producer would leave a channel nobody
+                    // can take over.
+                    lease_ms: 5_000,
+                }
+                .encode(w)
+            })?;
+        }
+        if channels.is_empty() {
+            println!("this effect reads no channels; nothing to drive");
+        } else {
+            println!("claimed channel(s) {channels:?}, driving at {DRIVE_HZ} Hz");
+        }
+
+        // Poll quickly from here on.
+        //
+        // The half-second timeout is right while waiting for a device to appear
+        // and badly wrong once driving one: the loop blocks in `recv_from` for
+        // up to 500 ms, so it can only publish about twice a second whatever
+        // `DRIVE_HZ` says. The device rendered a rock-steady 30 fps of a value
+        // that changed twice a second, which looks exactly like a device running
+        // at 2 fps and is not.
+        socket.set_read_timeout(Some(Duration::from_millis(2)))?;
+
         // Hold the show clock, and keep listening. A device that comes back
         // needing a program breaks out and gets provisioned again.
         let mut next_tick = Instant::now();
+        let mut next_drive = Instant::now();
+        let mut producer_seq: u16 = 0;
         loop {
+            // Drive the channels. A triangle rather than a sine: the turn at
+            // each end is the moment a dropped or stale update shows up as a
+            // visible flat spot, and a sine hides exactly that.
+            if !channels.is_empty() && Instant::now() >= next_drive {
+                next_drive += Duration::from_micros(1_000_000 / DRIVE_HZ as u64);
+                let phase = (show_now() % DRIVE_PERIOD_US) as f64 / DRIVE_PERIOD_US as f64;
+                let level = if phase < 0.5 { phase * 2.0 } else { (1.0 - phase) * 2.0 };
+                let q16 = (level * 65536.0) as i32;
+                producer_seq = producer_seq.wrapping_add(1);
+                for id in &channels {
+                    send(&socket, device, MsgType::Chan, &mut sequence, show_now(), |w| {
+                        Chan {
+                            channel_id: *id,
+                            producer_seq,
+                            payload: &q16.to_le_bytes(),
+                        }
+                        .encode(w)
+                    })?;
+                }
+            }
+
             if Instant::now() >= next_tick {
                 next_tick += Duration::from_secs(1);
                 send(&socket, device, MsgType::Tick, &mut sequence, show_now(), |w| {
@@ -220,6 +290,19 @@ device at {device} has no program; sending one");
                     }
                     .encode(w)
                 })?;
+                // Renew, so the lease never runs out under a producer that is
+                // still here. Cheaper than making the lease long: a long lease
+                // is how a channel ends up held by something that has gone.
+                for id in &channels {
+                    send(&socket, device, MsgType::ChanClaim, &mut sequence, show_now(), |w| {
+                        ChanClaim {
+                            channel_id: *id,
+                            priority: 100,
+                            lease_ms: 5_000,
+                        }
+                        .encode(w)
+                    })?;
+                }
             }
             let mut buf = [0u8; 64];
             match socket.recv_from(&mut buf) {
@@ -299,6 +382,20 @@ where
         .map_err(|e| format!("framing {msg_type:?}: {e:?}"))?;
     socket.send_to(&out[..n], to)?;
     Ok(())
+}
+
+/// The channels a compiled program reads, from its own header.
+///
+/// Read from the bytecode rather than from the source, because the header is
+/// what the device reads too — if the two disagreed, this would be publishing to
+/// a channel nobody is listening on and the strip would simply not respond.
+fn channel_ids(bytecode: &[u8]) -> Vec<u16> {
+    let Ok(program) = lumen_vm::program::Program::parse(bytecode) else {
+        return Vec::new();
+    };
+    (0..program.channel_count())
+        .filter_map(|slot| program.channel_id(slot as u8))
+        .collect()
 }
 
 fn arg_value(args: &[String], name: &str) -> Option<u64> {
