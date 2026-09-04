@@ -91,11 +91,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             None => None,
         };
+        // `--alert <effect.lfx>` fires that effect over the show on a timer,
+        // at a priority the show cannot beat and with an expiry that takes it
+        // away again.
+        let alert = match args.iter().position(|a| a == "--alert").and_then(|i| args.get(i + 1)) {
+            Some(path) => {
+                let text = std::fs::read_to_string(path)?;
+                match lumen_lang::compile(&text) {
+                    (Some(c), _) => Some(c.bytecode),
+                    (None, diags) => {
+                        eprintln!("{path} did not compile:
+{}", diags.render(&text));
+                        return Ok(());
+                    }
+                }
+            }
+            None => None,
+        };
         return peer::run(
             arg_value(&args, "--capacity").unwrap_or(2_000) as u32,
             PORT,
             play,
             arg_value(&args, "--leds").unwrap_or(30) as u16,
+            alert,
+            Duration::from_secs(arg_value(&args, "--alert-every").unwrap_or(20)),
+            arg_value(&args, "--alert-lasts").unwrap_or(6) * 1_000_000,
         )
         .map_err(Into::into);
     }
@@ -434,6 +454,7 @@ where
 /// The same sequence the controller sends, reachable from the peer so one
 /// process can both be a node in the mesh and hand a device something to draw.
 /// Two nodes rendering different things prove nothing about a shared timebase.
+#[allow(clippy::too_many_arguments)]
 pub fn provision(
     socket: &UdpSocket,
     to: SocketAddr,
@@ -441,10 +462,30 @@ pub fn provision(
     sequence: &mut u32,
     show_now: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    push_program(socket, to, bytecode, sequence, show_now, 0, 100, 3_600_000_000, [7; 16])
+}
+
+/// Load a program into `slot` and push a source that renders it.
+///
+/// `slot` and `priority` are what make an alert an alert: a second program in a
+/// second slot, pushed above the show, with an expiry that takes it away again.
+/// The device resolves the two per pixel and the higher one wins.
+#[allow(clippy::too_many_arguments)]
+pub fn push_program(
+    socket: &UdpSocket,
+    to: SocketAddr,
+    bytecode: &[u8],
+    sequence: &mut u32,
+    show_now: u64,
+    slot: u8,
+    priority: u8,
+    lasts_us: u64,
+    source: [u8; 16],
+) -> Result<(), Box<dyn std::error::Error>> {
     send(socket, to, MsgType::ProgBegin, sequence, show_now, |w| {
         ProgBegin {
-            program_id: 1,
-            slot: 0,
+            program_id: slot as u16 + 1,
+            slot,
             vm_min_version: 1,
             total_len: bytecode.len() as u32,
             device_class: "strip",
@@ -454,7 +495,7 @@ pub fn provision(
     for (i, part) in bytecode.chunks(CHUNK).enumerate() {
         send(socket, to, MsgType::ProgChunk, sequence, show_now, |w| {
             ProgChunk {
-                program_id: 1,
+                program_id: slot as u16 + 1,
                 offset: (i * CHUNK) as u32,
                 data: part,
             }
@@ -464,7 +505,7 @@ pub fn provision(
     }
     send(socket, to, MsgType::ProgEnd, sequence, show_now, |w| {
         ProgEnd {
-            program_id: 1,
+            program_id: slot as u16 + 1,
             sha256: [0; 32],
             sig: [0; 64],
         }
@@ -472,13 +513,13 @@ pub fn provision(
     })?;
     send(socket, to, MsgType::SrcPush, sequence, show_now, |w| {
         SrcPush {
-            source_id: Uuid([7; 16]),
+            source_id: Uuid(source),
             zone_id: Uuid([50; 16]),
-            scene_id: Uuid([7; 16]),
-            priority: 100,
+            scene_id: Uuid(source),
+            priority,
             fade_in_ms: 0,
             fade_out_ms: 0,
-            expires_at: Some(show_now + 3_600_000_000),
+            expires_at: Some(show_now + lasts_us),
             param_overrides: &[],
         }
         .encode(w)

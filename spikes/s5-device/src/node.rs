@@ -31,6 +31,15 @@ use lumen_vm::output::{Encoded, Output, PowerModel};
 use lumen_vm::program::Program;
 use lumen_vm::q16::Q16;
 
+/// Programs a device holds at once.
+///
+/// Two: a show and an alert over it. That is the smallest number that makes the
+/// source stack mean anything, and more than a spike needs to prove the point.
+pub const SLOTS: usize = 2;
+
+/// Sources this device will render at once.
+pub const MAX_SOURCES: usize = 4;
+
 /// Largest program this device will hold.
 ///
 /// The corpus runs 1–3 KB. Four is room to spare without pretending a device
@@ -82,10 +91,26 @@ pub struct Node {
     /// a device holds one program at a time here, and a half-received program
     /// replacing a running one is a visible failure the real firmware avoids
     /// with two slots. Called out rather than hidden — see RESULTS.
-    program: Vec<u8>,
-    program_len: usize,
+    /// One program per slot, so an alert can sit over a show.
+    ///
+    /// A device holding one program can only ever show one thing, which makes
+    /// the source stack - priority, expiry, a higher source winning a pixel -
+    /// untestable on hardware. Two is the smallest number that makes it real.
+    slots: [Vec<u8>; SLOTS],
+    slot_len: [usize; SLOTS],
+    /// Which slot is being filled, and how much is expected.
+    filling: Option<usize>,
     expected_len: usize,
-    receiving: bool,
+    /// Which slot each admitted source renders from.
+    ///
+    /// The real binding is a scene record naming a program, and this spike has
+    /// no records - so a source takes the slot of the program that most recently
+    /// finished arriving. That is the controller's contract here: send a
+    /// program, then push the source that uses it. Stated plainly because it is
+    /// the one place this device is not the real thing.
+    source_slot: [(Uuid, usize); MAX_SOURCES],
+    source_slots_used: usize,
+    last_filled: usize,
 
     /// Whether a source is currently admitted, so `main` can say so once rather
     /// than every frame.
@@ -135,10 +160,13 @@ impl Node {
             stack: SourceStack::new(100_000, 4),
             renderer: Renderer::new(),
             channels: Channels::new(),
-            program: vec![0; MAX_PROGRAM],
-            program_len: 0,
+            slots: [const { Vec::new() }; SLOTS],
+            slot_len: [0; SLOTS],
+            filling: None,
             expected_len: 0,
-            receiving: false,
+            source_slot: [(Uuid([0; 16]), 0); MAX_SOURCES],
+            source_slots_used: 0,
+            last_filled: 0,
             rendering: false,
             frame: vec![Rgb::BLACK; count as usize],
             // A 500 mA budget, which is what a USB port promises without
@@ -159,15 +187,44 @@ impl Node {
         self.leds.leds.len()
     }
 
-    /// Bytes of program held, so a silent device can say whether it ever got
-    /// one.
+    /// Bytes of program held across every slot, so a silent device can say
+    /// whether it ever got one.
     pub fn program_bytes(&self) -> usize {
-        self.program_len
+        self.slot_len.iter().sum()
     }
 
     /// Sources admitted, for the same reason.
     pub fn source_count(&self) -> usize {
         self.stack.active().len()
+    }
+
+    /// Remember which slot a source renders from.
+    ///
+    /// Overwrites an existing entry for the same source, so re-pushing a source
+    /// after loading a new program moves it rather than leaving both.
+    fn bind(&mut self, source: Uuid, slot: usize) {
+        for entry in self.source_slot[..self.source_slots_used].iter_mut() {
+            if entry.0 == source {
+                entry.1 = slot;
+                return;
+            }
+        }
+        if self.source_slots_used < MAX_SOURCES {
+            self.source_slot[self.source_slots_used] = (source, slot);
+            self.source_slots_used += 1;
+        }
+    }
+
+    /// Which slot a source renders from; slot 0 if it was never bound.
+    ///
+    /// Falling back rather than refusing: a source whose binding was lost should
+    /// show *something*, and slot 0 is the show. A device is never dark because
+    /// of software.
+    fn slot_of(&self, source: Uuid) -> usize {
+        self.source_slot[..self.source_slots_used]
+            .iter()
+            .find(|(id, _)| *id == source)
+            .map_or(0, |(_, slot)| *slot)
     }
 
     /// Show time, which the caller already holds.
@@ -203,29 +260,36 @@ impl Node {
                 if begin.total_len as usize > MAX_PROGRAM {
                     return Handled::ProgramRejected;
                 }
+                // `slot` is the controller's choice, clamped rather than
+                // refused: a device with two slots asked for a third should
+                // overwrite something rather than ignore the program and leave
+                // the sender believing it landed.
+                let slot = (begin.slot as usize).min(SLOTS - 1);
                 self.expected_len = begin.total_len as usize;
-                self.program_len = 0;
-                self.receiving = true;
+                self.slots[slot].clear();
+                self.slots[slot].resize(MAX_PROGRAM, 0);
+                self.slot_len[slot] = 0;
+                self.filling = Some(slot);
                 Handled::ProgramStarted {
                     len: begin.total_len,
                 }
             }
 
             Payload::ProgChunk(chunk) => {
-                if !self.receiving {
+                let Some(slot) = self.filling else {
                     return Handled::Ignored;
-                }
+                };
                 let at = chunk.offset as usize;
                 let end = at + chunk.data.len();
                 if end > self.expected_len || end > MAX_PROGRAM {
                     // A chunk outside the length the sender declared is either a
                     // corrupt transfer or a different program's chunk arriving
                     // late. Either way, writing it would scribble on the buffer.
-                    self.receiving = false;
+                    self.filling = None;
                     return Handled::ProgramRejected;
                 }
-                self.program[at..end].copy_from_slice(chunk.data);
-                self.program_len = self.program_len.max(end);
+                self.slots[slot][at..end].copy_from_slice(chunk.data);
+                self.slot_len[slot] = self.slot_len[slot].max(end);
                 Handled::ProgramChunk {
                     at: chunk.offset,
                     len: chunk.data.len(),
@@ -233,15 +297,17 @@ impl Node {
             }
 
             Payload::ProgEnd(_) => {
-                if !self.receiving || self.program_len != self.expected_len {
-                    self.receiving = false;
+                let Some(slot) = self.filling.take() else {
+                    return Handled::ProgramRejected;
+                };
+                if self.slot_len[slot] != self.expected_len {
+                    self.slot_len[slot] = 0;
                     return Handled::ProgramRejected;
                 }
-                self.receiving = false;
                 // Parsed once, here, rather than every frame. The answer cannot
                 // change, and re-parsing at 30 Hz is a measurable slice of a
                 // frame spent proving something already known.
-                match Program::parse(&self.program[..self.program_len]) {
+                match Program::parse(&self.slots[slot][..self.slot_len[slot]]) {
                     Ok(p) => {
                         // Declare what this program reads. A channel nobody has
                         // published to yet reads its default, so an effect is
@@ -255,14 +321,15 @@ impl Node {
                                 self.channels.declare(Channel::new(id, 2_000, Q16::ZERO));
                             }
                         }
+                        self.last_filled = slot;
                         Handled::ProgramComplete {
-                            len: self.program_len,
+                            len: self.slot_len[slot],
                             budget: p.budget,
                             channels: p.channel_count(),
                         }
                     }
                     Err(_) => {
-                        self.program_len = 0;
+                        self.slot_len[slot] = 0;
                         Handled::ProgramRejected
                     }
                 }
@@ -336,6 +403,7 @@ impl Node {
                     .push(self.show_time(now_us), source, &mut Vec::new())
                 {
                     Ok(()) => {
+                        self.bind(push.source_id, self.last_filled);
                         self.rendering = true;
                         Handled::SourcePushed {
                             priority: push.priority,
@@ -362,10 +430,9 @@ impl Node {
     /// source keeps showing what it was showing, which is what makes an ambient
     /// floor a floor rather than a special case.
     pub fn render(&mut self, now_us: u64, out: &mut [u8]) -> Option<(u32, Encoded, Rendered)> {
-        if self.program_len == 0 {
+        if self.program_bytes() == 0 || self.stack.active().is_empty() {
             return None;
         }
-        let program = Program::parse(&self.program[..self.program_len]).ok()?;
         // Quantised to the frame grid. Two synchronised nodes never render on
         // the same microsecond, and rendering at whatever moment each happened
         // to wake would make identical clocks produce different frames - which
@@ -373,16 +440,43 @@ impl Node {
         let show_us = (self.show_time(now_us) / FRAME_US) * FRAME_US;
         let t = Q16::from_micros(show_us);
 
-        // The device's channels, seen as this program's uniforms. Without this
-        // every channel read returns zero - which is exactly what a channel with
-        // no producer correctly returns, so the mistake is invisible.
-        let mut uniforms = ChannelUniforms::new(&self.channels, &program, show_us);
-        let bound = [Bound {
-            source: *self.stack.active().first()?,
-            program: &program,
-            membership: &self.membership,
-            projection: self.zone.projection,
-        }];
+        // Every admitted source, each with the program it was pushed against.
+        //
+        // One source was enough to light a strip and could never show what the
+        // stack is *for*: an alert over a show, resolved per pixel, with the
+        // higher priority winning and the lower one still there underneath when
+        // it expires. The render loop has always done this; a device holding one
+        // program simply never asked it to.
+        let mut programs: [Option<Program<'_>>; MAX_SOURCES] = [const { None }; MAX_SOURCES];
+        let mut bound: Vec<Bound<'_>> = Vec::new();
+        let active: Vec<Source> = self.stack.active().to_vec();
+        for (i, source) in active.iter().enumerate().take(MAX_SOURCES) {
+            let slot = self.slot_of(source.id);
+            if self.slot_len[slot] == 0 {
+                continue;
+            }
+            programs[i] = Program::parse(&self.slots[slot][..self.slot_len[slot]]).ok();
+        }
+        for (i, source) in active.iter().enumerate().take(MAX_SOURCES) {
+            if let Some(program) = &programs[i] {
+                bound.push(Bound {
+                    source: *source,
+                    program,
+                    membership: &self.membership,
+                    projection: self.zone.projection,
+                });
+            }
+        }
+        if bound.is_empty() {
+            return None;
+        }
+
+        // Channels are read through the program that declares them. With several
+        // sources the first one's table is used, which is right while every
+        // effect on this device reads the same channels and is a known
+        // simplification the moment two of them do not.
+        let first = bound[0].program;
+        let mut uniforms = ChannelUniforms::new(&self.channels, first, show_us);
         let report = self.renderer.render_shard(
             show_us,
             t,

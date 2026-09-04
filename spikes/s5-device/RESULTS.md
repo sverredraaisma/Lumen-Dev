@@ -212,6 +212,35 @@ It is how "the tail is missing" was settled without touching hardware — the ta
 was there, and short because `decay 0.9` is quoted per frame at 60 fps, which is
 0.81 per frame at 30.
 
+## An alert over a show, clearing itself
+
+The device holds **two programs**, one per slot, and renders every admitted
+source against the one it was pushed with. That is the smallest change that
+makes the source stack mean anything on hardware: a device holding one program
+can only show one thing, so priority, expiry and per-pixel resolution had never
+been exercised outside the simulator.
+
+Measured, with `breathe` in slot 0 at priority 100 and a red alert in slot 1 at
+priority 230 with a six-second expiry:
+
+```
+program complete: 1716 bytes, 215 units/pixel   breathe
+source pushed at priority 100
+program complete: 1604 bytes,  76 units/pixel   alert
+source pushed at priority 230
+150 frames in 5 s, 8061 units/frame             both rendering
+150 frames in 5 s, 6626 units/frame             alert expired, breathe alone
+```
+
+The frame cost is the evidence: 6626 is breathe by itself, 8061 is both. Nothing
+sends a "stop" — the alert removes itself because its expiry passed, which is why
+the expiry is not optional above the ambient floor.
+
+One honesty note. The real binding from a source to a program is a scene record
+naming one, and this spike has no records — so a source takes the slot of the
+program that most recently finished arriving. That is the controller's contract
+here, and it is the one place this device is not the real thing.
+
 ## Two things left out on purpose
 
 **`ProgEnd` carries a zeroed hash and signature, and the device does not check

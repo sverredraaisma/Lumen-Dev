@@ -104,7 +104,16 @@ impl ShowClock {
 ///
 /// `capacity` decides who leads. The firmware reports 1194 for a C3 and 1714 for
 /// an S3 — pass something higher to take the mesh over, or lower to follow it.
-pub fn run(capacity: u32, port: u16, play: Option<Vec<u8>>, leds: u16) -> std::io::Result<()> {
+#[allow(clippy::too_many_arguments)]
+pub fn run(
+    capacity: u32,
+    port: u16,
+    play: Option<Vec<u8>>,
+    leds: u16,
+    alert: Option<Vec<u8>>,
+    alert_every: Duration,
+    alert_lasts_us: u64,
+) -> std::io::Result<()> {
     let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port))?;
     socket.set_broadcast(true)?;
     socket.set_read_timeout(Some(Duration::from_millis(2)))?;
@@ -154,6 +163,11 @@ pub fn run(capacity: u32, port: u16, play: Option<Vec<u8>>, leds: u16) -> std::i
     // different things prove nothing about a shared timebase. One process, so
     // there is one socket on the port.
     let mut sequence = 0u32;
+    // An alert over the show, on a timer, so the source stack can be watched
+    // doing what it is for: a higher priority winning every pixel, and the show
+    // still underneath when the alert expires by itself.
+    let mut next_alert = Instant::now() + alert_every;
+    let mut provisioned: Option<SocketAddr> = None;
 
     let mut buf = [0u8; 1500];
     loop {
@@ -279,6 +293,7 @@ pub fn run(capacity: u32, port: u16, play: Option<Vec<u8>>, leds: u16) -> std::i
                         let to = SocketAddr::V4(SocketAddrV4::new(*v4.ip(), port));
                         if crate::provision(&socket, to, code, &mut sequence, now).is_ok() {
                             println!("  gave {} the effect", v4.ip());
+                            provisioned = Some(to);
                         }
                     }
                     continue;
@@ -308,6 +323,24 @@ pub fn run(capacity: u32, port: u16, play: Option<Vec<u8>>, leds: u16) -> std::i
             let index = now / FRAME_US;
             if last_frame.map(|(i, _)| i) != Some(index) {
                 last_frame = Some((index, l.frame(index * FRAME_US)));
+            }
+        }
+
+        if let (Some(code), Some(to)) = (&alert, provisioned) {
+            if Instant::now() >= next_alert {
+                next_alert = Instant::now() + alert_every;
+                // Slot 1, priority 230, and an expiry. The expiry is not
+                // optional above the ambient floor: it is what stops a
+                // controller that walks away from leaving an alert up for ever,
+                // and it is what makes this clear itself.
+                let secs = alert_lasts_us / 1_000_000;
+                if crate::push_program(
+                    &socket, to, code, &mut sequence, now, 1, 230, alert_lasts_us, [9; 16],
+                )
+                .is_ok()
+                {
+                    println!("  ALERT over the show for {secs} s");
+                }
             }
         }
 
