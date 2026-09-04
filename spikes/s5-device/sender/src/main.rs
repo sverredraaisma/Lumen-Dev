@@ -75,9 +75,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Before the effect is read: a peer plays nothing, it only elects and
     // syncs, so requiring a file it will not compile would be a poor joke.
     if args.iter().any(|a| a == "--peer") {
+        // A peer may also render, so two nodes can be compared frame for frame:
+        // `--peer <effect.lfx>` elects, syncs, *and* draws.
+        let play = match args.first().filter(|a| a.ends_with(".lfx")) {
+            Some(path) => {
+                let text = std::fs::read_to_string(path)?;
+                match lumen_lang::compile(&text) {
+                    (Some(c), _) => Some(c.bytecode),
+                    (None, diags) => {
+                        eprintln!("{path} did not compile:
+{}", diags.render(&text));
+                        return Ok(());
+                    }
+                }
+            }
+            None => None,
+        };
         return peer::run(
             arg_value(&args, "--capacity").unwrap_or(2_000) as u32,
             PORT,
+            play,
+            arg_value(&args, "--leds").unwrap_or(30) as u16,
         )
         .map_err(Into::into);
     }
@@ -374,7 +392,7 @@ fn wait_for_needy_device(socket: &UdpSocket) -> std::io::Result<SocketAddr> {
 }
 
 /// Frame a payload as a Lumen datagram and send it.
-fn send<F>(
+pub fn send<F>(
     socket: &UdpSocket,
     to: SocketAddr,
     msg_type: MsgType,
@@ -408,6 +426,63 @@ where
         .encode(&mut out)
         .map_err(|e| format!("framing {msg_type:?}: {e:?}"))?;
     socket.send_to(&out[..n], to)?;
+    Ok(())
+}
+
+/// Give a device a program and put it on the source stack.
+///
+/// The same sequence the controller sends, reachable from the peer so one
+/// process can both be a node in the mesh and hand a device something to draw.
+/// Two nodes rendering different things prove nothing about a shared timebase.
+pub fn provision(
+    socket: &UdpSocket,
+    to: SocketAddr,
+    bytecode: &[u8],
+    sequence: &mut u32,
+    show_now: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    send(socket, to, MsgType::ProgBegin, sequence, show_now, |w| {
+        ProgBegin {
+            program_id: 1,
+            slot: 0,
+            vm_min_version: 1,
+            total_len: bytecode.len() as u32,
+            device_class: "strip",
+        }
+        .encode(w)
+    })?;
+    for (i, part) in bytecode.chunks(CHUNK).enumerate() {
+        send(socket, to, MsgType::ProgChunk, sequence, show_now, |w| {
+            ProgChunk {
+                program_id: 1,
+                offset: (i * CHUNK) as u32,
+                data: part,
+            }
+            .encode(w)
+        })?;
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    send(socket, to, MsgType::ProgEnd, sequence, show_now, |w| {
+        ProgEnd {
+            program_id: 1,
+            sha256: [0; 32],
+            sig: [0; 64],
+        }
+        .encode(w)
+    })?;
+    send(socket, to, MsgType::SrcPush, sequence, show_now, |w| {
+        SrcPush {
+            source_id: Uuid([7; 16]),
+            zone_id: Uuid([50; 16]),
+            scene_id: Uuid([7; 16]),
+            priority: 100,
+            fade_in_ms: 0,
+            fade_out_ms: 0,
+            expires_at: Some(show_now + 3_600_000_000),
+            param_overrides: &[],
+        }
+        .encode(w)
+    })?;
     Ok(())
 }
 

@@ -92,7 +92,44 @@ multicast against 0.00% on unicast over this same access point, so for the
 handful of peers a house has, addressing them directly is simply better. The
 broadcast remains only to find peers that are not yet known.
 
+## Both nodes now draw the same grid
+
+Show time is quantised to a 33 333 µs frame grid before rendering, on the device
+and on the peer. Two synchronised nodes never render on the same microsecond, so
+without this two identical clocks would still produce different frames — and
+"the same frame" would be untestable by construction.
+
+The peer renders the effect it gives the device, and both report a frame index
+and a fingerprint:
+
+```
+device  == frame #1459 99ff6fbc6d9c2d8f at show 48632847 us
+peer       frame #3605 51254d7e61ace2db at show 120165465 us
+```
+
 ## What M2 still owes
+
+The exit criterion is *"two devices, powered on in either order, discover each
+other, elect a timebase, and change colour on the same frame."* Election,
+discovery and failover are demonstrated. **The last clause is not, and the two
+lines above are why:** they were printed at different wall instants, so they say
+nothing about whether the nodes agreed. Comparing frames needs both fingerprints
+from one moment, which means putting the fingerprint on the wire — a small
+protocol addition, and the obvious next step.
+
+The clock evidence bounds it. Skew measured one-way is **4 ms** when the peer
+only elects and syncs, and **13–24 ms** once it is also rendering at 30 fps in
+the same loop — the extra being its own receive latency, not the mesh's. Against
+a 33 ms frame, the second figure is close enough to a frame period that the two
+nodes may genuinely be one frame apart, and no amount of staring at logs will
+say which.
+
+So: the timebase is shared to within milliseconds, and whether that lands both
+nodes on the same frame is measured, unproven, and marginal. That is worth
+knowing precisely rather than claiming either way.
+
+Two devices with LEDs settle the visible half in a second. One ESP32-S3 is on the
+desk and was not connected when this ran.
 
 The exit criterion is *"two devices, powered on in either order, discover each
 other, elect a timebase, and change colour on the same frame."*

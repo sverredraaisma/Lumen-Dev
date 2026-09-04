@@ -153,7 +153,10 @@ const HELLO_INTERVAL_US: u64 = 1_000_000;
 
 /// Frame period. 30 fps for a first light - the C3 has headroom for 60 at 30
 /// LEDs, and a slower frame makes a stutter easier to see by eye.
-const FRAME_US: u64 = 33_333;
+///
+/// The same grid `node::FRAME_US` quantises show time to, so every device in the
+/// mesh draws the same frame at the same moment.
+use node::FRAME_US;
 
 fn now_us() -> u64 {
     esp_hal::time::now().duration_since_epoch().to_micros()
@@ -614,7 +617,16 @@ fn device_loop(
             // against this one. Printed once per report rather than per frame:
             // it is a spot check, and a line per frame would measure `println!`.
             if let Some(r) = last_render {
-                println!("== frame {:016x} at show {} us", r.digest, r.show_us);
+                // The frame *index* as well as the time. Two synchronised nodes
+                // will never render on the same microsecond, but they land on
+                // the same frame of the same grid - and that is what "changing
+                // colour on the same frame" actually means.
+                println!(
+                    "== frame #{} {:016x} at show {} us",
+                    r.show_us / FRAME_US,
+                    r.digest,
+                    r.show_us
+                );
             }
             frames = 0;
             spent_total = 0;

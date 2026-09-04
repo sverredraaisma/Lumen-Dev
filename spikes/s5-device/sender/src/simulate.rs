@@ -139,6 +139,54 @@ fn render_forward(
     }
 }
 
+/// A renderer parked on one effect, for a node that draws rather than sends.
+pub struct Live {
+    fixture: Fixture,
+    bytecode: Vec<u8>,
+    renderer: Renderer,
+    out: Vec<Rgb>,
+}
+
+impl Live {
+    pub fn new(bytecode: Vec<u8>, leds: u16) -> Option<Live> {
+        Program::parse(&bytecode).ok()?;
+        Some(Live {
+            fixture: fixture(leds),
+            bytecode,
+            renderer: Renderer::new(),
+            out: vec![Rgb::BLACK; leds as usize],
+        })
+    }
+
+    /// Render the frame at `show_us` and return its fingerprint.
+    ///
+    /// `show_us` must already be on the frame grid: two synchronised nodes never
+    /// render on the same microsecond, and comparing frames drawn at whatever
+    /// moment each happened to wake would show a difference that is not there.
+    pub fn frame(&mut self, show_us: u64) -> u64 {
+        let f = &self.fixture;
+        let program = Program::parse(&self.bytecode).expect("checked at construction");
+        let bound = [Bound {
+            source: f.source,
+            program: &program,
+            membership: &f.membership,
+            projection: f.zone.projection,
+        }];
+        let leds = self.out.len() as u16;
+        self.renderer.render_shard(
+            show_us,
+            Q16::from_micros(show_us),
+            &f.dev,
+            &f.stack,
+            &bound,
+            &mut NoUniforms,
+            &mut self.out,
+            Shard::whole(leds),
+        );
+        digest_of(&self.out)
+    }
+}
+
 /// One frame's fingerprint, hashed the way a device hashes it.
 fn digest_of(frame: &[Rgb]) -> u64 {
     let mut d = Digest::new();

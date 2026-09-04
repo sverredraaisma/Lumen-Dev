@@ -29,6 +29,9 @@ use lumen_device::node::Node as MeshNode;
 use lumen_device::{Action, Destination, Event, Identity, Role};
 use lumen_proto::Uuid;
 
+/// The frame grid every node in the mesh draws on, matching the firmware's.
+const FRAME_US: u64 = 33_333;
+
 /// The mesh, as the core wants it. Its first two bytes are the wire prefix.
 const MESH_UUID: [u8; 16] = [
     0x4c, 0x4d, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
@@ -101,7 +104,7 @@ impl ShowClock {
 ///
 /// `capacity` decides who leads. The firmware reports 1194 for a C3 and 1714 for
 /// an S3 — pass something higher to take the mesh over, or lower to follow it.
-pub fn run(capacity: u32, port: u16) -> std::io::Result<()> {
+pub fn run(capacity: u32, port: u16, play: Option<Vec<u8>>, leds: u16) -> std::io::Result<()> {
     let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port))?;
     socket.set_broadcast(true)?;
     socket.set_read_timeout(Some(Duration::from_millis(2)))?;
@@ -135,6 +138,18 @@ pub fn run(capacity: u32, port: u16) -> std::io::Result<()> {
         id[0], id[1], id[2], id[3]
     );
     println!("(a device reports 1194 for a C3, 1714 for an S3)");
+
+    // Rendering the same effect as the device, on the same frame grid, so the
+    // two can be compared frame for frame rather than by eye.
+    let mut live = play
+        .as_ref()
+        .and_then(|bytecode| crate::simulate::Live::new(bytecode.clone(), leds));
+    let mut last_frame = None;
+
+    // And giving the device that same effect, because two nodes drawing
+    // different things prove nothing about a shared timebase. One process, so
+    // there is one socket on the port.
+    let mut sequence = 0u32;
 
     let mut buf = [0u8; 1500];
     loop {
@@ -205,6 +220,17 @@ pub fn run(capacity: u32, port: u16) -> std::io::Result<()> {
                         }
                     }
                 }
+                // A device announcing that it holds nothing gets the effect.
+                if n >= 2 && buf[0] == 0xA5 && buf[1] == 0 {
+                    if let (Some(code), SocketAddr::V4(v4)) = (&play, from) {
+                        let to = SocketAddr::V4(SocketAddrV4::new(*v4.ip(), port));
+                        if crate::provision(&socket, to, code, &mut sequence, now).is_ok() {
+                            println!("  gave {} the effect", v4.ip());
+                        }
+                    }
+                    continue;
+                }
+
                 let actions = mesh.on_event(now, Event::Datagram { bytes: &buf[..n] });
                 if !actions.is_empty() {
                     deadline_us = apply(
@@ -225,6 +251,13 @@ pub fn run(capacity: u32, port: u16) -> std::io::Result<()> {
             Err(e) => return Err(e),
         }
 
+        if let Some(l) = live.as_mut() {
+            let index = now / FRAME_US;
+            if last_frame.map(|(i, _)| i) != Some(index) {
+                last_frame = Some((index, l.frame(index * FRAME_US)));
+            }
+        }
+
         if last_report.elapsed() >= Duration::from_secs(5) {
             last_report = Instant::now();
             println!(
@@ -237,6 +270,9 @@ pub fn run(capacity: u32, port: u16) -> std::io::Result<()> {
             // an average that includes the seconds before a node synchronised
             // never recovers from them, and reports a mesh as broken long after
             // it has converged.
+            if let Some((index, digest)) = last_frame {
+                println!("  frame #{index} {digest:016x} at show {} us", index * FRAME_US);
+            }
             if skew_samples > 0 {
                 println!(
                     "  clock skew this window: mean {} us, worst {worst_skew_us} us, over {skew_samples} datagrams",

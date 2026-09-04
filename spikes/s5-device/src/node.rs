@@ -366,7 +366,11 @@ impl Node {
             return None;
         }
         let program = Program::parse(&self.program[..self.program_len]).ok()?;
-        let show_us = self.show_time(now_us);
+        // Quantised to the frame grid. Two synchronised nodes never render on
+        // the same microsecond, and rendering at whatever moment each happened
+        // to wake would make identical clocks produce different frames - which
+        // is exactly the disagreement everything else is arranged to prevent.
+        let show_us = (self.show_time(now_us) / FRAME_US) * FRAME_US;
         let t = Q16::from_micros(show_us);
 
         // The device's channels, seen as this program's uniforms. Without this
@@ -444,6 +448,13 @@ pub struct Rendered {
     /// devices agreeing on a hash for different moments have proved nothing.
     pub show_us: u64,
 }
+
+/// The frame grid every device in the mesh renders on.
+///
+/// 30 fps, a whole number of microseconds so the grid does not drift, and a
+/// divisor of the mesh's 120 Hz timing grid so mixed-rate devices stay in phase
+/// rather than beating against each other.
+pub const FRAME_US: u64 = 33_333;
 
 /// Channels the linear staging buffer holds. 300 LEDs, the size the project
 /// sizes against, so the same firmware drives a longer strip unchanged.
