@@ -230,6 +230,17 @@ fn device_loop(
         }))
         .expect("configure");
     controller.start().expect("start wifi");
+    // Clear the strip before anything else. An LED holds its last value until
+    // something writes a new one, so a device that reboots leaves the previous
+    // firmware's final frame lit - which looks exactly like a device that has
+    // hung, and is the first thing anybody would go and debug.
+    //
+    // "A device is never dark because of software" is about not *losing* a show
+    // to a fault. Sitting on a frame from before a reboot is not holding a show,
+    // it is lying about one.
+    pixels.fill(0);
+    let _ = led_strip.show(pixels);
+
     println!("== connecting to {SSID}");
 
     let mut attempt = 0u32;
