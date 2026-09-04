@@ -96,7 +96,7 @@ Three assumptions carry the architecture, and all three need real hardware:
 | # | Spike | Passes if | Result |
 |---|---|---|---|
 | S1 | Time sync across 3 ESP32s on ordinary WiFi, 24 h | 95th percentile offset under ±500 µs, no drift | **fails the number, meets the requirement** |
-| S2 | Bytecode interpreter in Rust, per-pixel, 300 LEDs | 60 fps with ≥1000 instructions/pixel headroom on an S3 | **conditional pass** |
+| S2 | Bytecode interpreter in Rust, per-pixel, 300 LEDs | 60 fps with ≥1000 instructions/pixel headroom on an S3 | **conditional pass, now on the S3 too** |
 | S3 | Multicast CHAN at 60 Hz to 10+ devices on a consumer AP | Loss under 1%, jitter under a frame | **multicast fails, unicast passes on loss** |
 
 **S2 ran on a C3 and passed on the thing that mattered, not on its own
@@ -128,6 +128,13 @@ better than 2×). Longer is not monotonically better — at 128 the crystal's
 33 µs/s drift accumulates inside the window faster than the noise averages out.
 Full findings in `spikes/s1-time-sync/RESULTS.md`.
 
+**S2 has since run on the actual S3**, the chip its criterion named. It is 1.4x
+faster than the C3 - close to the 1.5x its clock ratio predicts - and the worst
+corpus effect drops from 86% of a 60 fps frame to 60%. The speedup is *entirely*
+the clock: 583 ns per instruction against 838, which at their respective clocks
+is 140 cycles against 134. A faster ESP32 buys its clock and nothing else, which
+is worth knowing before reaching for a bigger chip to buy headroom.
+
 Two things came out of S2 that changed the code. The interpreter is
 **dispatch-bound** — 837 ns of every instruction is dispatch, 134 cycles, about
 80% of an average one. And the cost model was wrong: it mis-ranked real effects
@@ -136,6 +143,16 @@ budget unit is now **100 ns on a C3**. Full findings in
 `spikes/s2-vm-throughput/RESULTS.md`.
 
 A few hundred lines each, and far cheaper than discovering the problem later.
+
+## Supporting cheaper hardware
+
+`docs/esp8266.md` costs out the ESP8266 and ESP-01. The short version: **there
+is no Rust WiFi for the ESP8266 and no path to one that is not months of work**,
+because its radio blobs come from the NONOS SDK and predate the adapter
+interface `esp-wifi` is built on. The cheaper and better route is to compile the
+portable core - `lumen-vm`, `lumen-proto`, `lumen-hal`, all `no_std` and
+allocator-free - as a static library and let C own the radio. Verified: all
+three build for bare Xtensa today.
 
 ## Compact instructions
 
