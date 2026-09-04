@@ -263,6 +263,28 @@ The `seconds` parameter is clamped to 1–300 rather than honoured. The expiry i
 the safety property that stops a room being red for ever, so a query string does
 not get to ask for zero or for an afternoon.
 
+## Two effects, one strip, a zone each
+
+The device resolves three zones — the whole strip and each half — and renders
+every source against the zone it named:
+
+```
+program complete: 1784 bytes, 435 units/pixel   comet   -> first half
+program complete: 1716 bytes, 215 units/pixel   breathe -> second half
+10041 units/frame
+```
+
+The arithmetic is the evidence: 435 x 15 + 215 x 15 is 9 750, plus both frame
+sections. Each effect renders **fifteen pixels, not thirty**.
+
+And the comet completes a lap across fifteen LEDs rather than being stretched
+over the strip, because `u` runs 0..1 across *the zone a source targets*. That is
+what makes an effect independent of the fixture it lands on — the property the
+whole projection design exists for — and it had only ever run in the simulator.
+
+Zones are defined locally here. In the real system a zone is a record that
+arrives over the wire and is resolved on a mapping change, never per frame.
+
 ## Two things left out on purpose
 
 **`ProgEnd` carries a zeroed hash and signature, and the device does not check

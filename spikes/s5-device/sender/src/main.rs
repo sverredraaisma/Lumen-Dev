@@ -52,6 +52,13 @@ const HELLO: u8 = 0xA5;
 /// to avoid.
 const CHUNK: usize = 1024;
 
+/// Zones a device resolves: the whole strip, and each half. Matching the
+/// firmware's, because a zone id nobody recognises falls back to the whole
+/// device and the difference would be silent.
+pub const ZONE_ALL: u8 = 50;
+pub const ZONE_FIRST: u8 = 51;
+pub const ZONE_SECOND: u8 = 52;
+
 /// How often a driven channel is published.
 ///
 /// Thirty, matching the device's frame rate. Faster would be spending bandwidth
@@ -96,6 +103,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // `--alert <effect.lfx>` fires that effect over the show on a timer,
         // at a priority the show cannot beat and with an expiry that takes it
         // away again.
+        // `--split <effect.lfx>` puts that effect on the second half of the
+        // strip while the first argument takes the first half.
+        let split = match args.iter().position(|a| a == "--split").and_then(|i| args.get(i + 1)) {
+            Some(path) => {
+                let text = std::fs::read_to_string(path)?;
+                match lumen_lang::compile(&text) {
+                    (Some(c), _) => Some(c.bytecode),
+                    (None, diags) => {
+                        eprintln!("{path} did not compile:
+{}", diags.render(&text));
+                        return Ok(());
+                    }
+                }
+            }
+            None => None,
+        };
         let alert = match args.iter().position(|a| a == "--alert").and_then(|i| args.get(i + 1)) {
             Some(path) => {
                 let text = std::fs::read_to_string(path)?;
@@ -115,6 +138,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             PORT,
             play,
             arg_value(&args, "--leds").unwrap_or(30) as u16,
+            split,
             alert,
             // No repeating alert unless asked: a timer that fires every twenty
             // seconds is a demonstration, not a default.
@@ -130,6 +154,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let source_path = &args[0];
     let priority = arg_value(&args, "--priority").unwrap_or(100) as u8;
     let seconds = arg_value(&args, "--seconds").unwrap_or(600);
+    // `--zone first|second` puts an effect on half the strip, so two can share
+    // one device and each gets its own `u` running 0..1 across its own LEDs.
+    let target_zone = match args
+        .iter()
+        .position(|a| a == "--zone")
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str)
+    {
+        Some("first") => ZONE_FIRST,
+        Some("second") => ZONE_SECOND,
+        _ => ZONE_ALL,
+    };
 
     // Compile with the real compiler, or take bytecode straight if that is what
     // was handed over. Both paths exist because "does my effect work on real
@@ -266,7 +302,7 @@ device at {device} has no program; sending one");
         send(&socket, device, MsgType::SrcPush, &mut sequence, show_now(), |w| {
             SrcPush {
                 source_id: Uuid([7; 16]),
-                zone_id: Uuid([50; 16]),
+                zone_id: Uuid([target_zone; 16]),
                 scene_id: Uuid([7; 16]),
                 priority,
                 fade_in_ms: 500,
@@ -469,7 +505,18 @@ pub fn provision(
     sequence: &mut u32,
     show_now: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    push_program(socket, to, bytecode, sequence, show_now, 0, 100, 3_600_000_000, [7; 16])
+    push_program(
+        socket,
+        to,
+        bytecode,
+        sequence,
+        show_now,
+        0,
+        100,
+        3_600_000_000,
+        [7; 16],
+        ZONE_ALL,
+    )
 }
 
 /// Load a program into `slot` and push a source that renders it.
@@ -488,6 +535,7 @@ pub fn push_program(
     priority: u8,
     lasts_us: u64,
     source: [u8; 16],
+    zone: u8,
 ) -> Result<(), Box<dyn std::error::Error>> {
     send(socket, to, MsgType::ProgBegin, sequence, show_now, |w| {
         ProgBegin {
@@ -521,7 +569,7 @@ pub fn push_program(
     send(socket, to, MsgType::SrcPush, sequence, show_now, |w| {
         SrcPush {
             source_id: Uuid(source),
-            zone_id: Uuid([50; 16]),
+            zone_id: Uuid([zone; 16]),
             scene_id: Uuid(source),
             priority,
             fade_in_ms: 0,

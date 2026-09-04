@@ -110,6 +110,7 @@ pub fn run(
     port: u16,
     play: Option<Vec<u8>>,
     leds: u16,
+    split: Option<Vec<u8>>,
     alert: Option<Vec<u8>>,
     alert_every: Duration,
     alert_lasts_us: u64,
@@ -310,8 +311,32 @@ pub fn run(
                 if n >= 2 && buf[0] == 0xA5 && buf[1] == 0 {
                     if let (Some(code), SocketAddr::V4(v4)) = (&play, from) {
                         let to = SocketAddr::V4(SocketAddrV4::new(*v4.ip(), port));
-                        if crate::provision(&socket, to, code, &mut sequence, now).is_ok() {
-                            println!("  gave {} the effect", v4.ip());
+                        let ok = match &split {
+                            // Two effects, one strip: each takes a half, and
+                            // each gets its own `u` running 0..1 across its own
+                            // LEDs rather than across the fixture. That is what
+                            // makes an effect independent of what it lands on.
+                            Some(other) => {
+                                crate::push_program(
+                                    &socket, to, code, &mut sequence, now,
+                                    0, 100, 3_600_000_000, [7; 16], crate::ZONE_FIRST,
+                                )
+                                .and_then(|()| {
+                                    crate::push_program(
+                                        &socket, to, other, &mut sequence, now,
+                                        1, 100, 3_600_000_000, [8; 16], crate::ZONE_SECOND,
+                                    )
+                                })
+                                .is_ok()
+                            }
+                            None => crate::provision(&socket, to, code, &mut sequence, now).is_ok(),
+                        };
+                        if ok {
+                            println!(
+                                "  gave {} {}",
+                                v4.ip(),
+                                if split.is_some() { "two effects, one per half" } else { "the effect" }
+                            );
                         }
                     }
                     continue;
@@ -359,6 +384,7 @@ pub fn run(
                             230,
                             seconds * 1_000_000,
                             [9; 16],
+                            crate::ZONE_ALL,
                         )
                         .is_ok()
                         {
@@ -399,7 +425,16 @@ pub fn run(
                 // and it is what makes this clear itself.
                 let secs = alert_lasts_us / 1_000_000;
                 if crate::push_program(
-                    &socket, to, code, &mut sequence, now, 1, 230, alert_lasts_us, [9; 16],
+                    &socket,
+                    to,
+                    code,
+                    &mut sequence,
+                    now,
+                    1,
+                    230,
+                    alert_lasts_us,
+                    [9; 16],
+                    crate::ZONE_ALL,
                 )
                 .is_ok()
                 {

@@ -31,6 +31,14 @@ use lumen_vm::output::{Encoded, Output, PowerModel};
 use lumen_vm::program::Program;
 use lumen_vm::q16::Q16;
 
+/// Zones this device resolves: the whole strip, and each half.
+pub const ZONES: usize = 3;
+
+/// Zone ids, as the byte every one of a zone UUID's sixteen bytes is set to.
+pub const ZONE_ALL: u8 = 50;
+pub const ZONE_FIRST: u8 = 51;
+pub const ZONE_SECOND: u8 = 52;
+
 /// Programs a device holds at once.
 ///
 /// Two: a show and an alert over it. That is the smallest number that makes the
@@ -75,8 +83,17 @@ pub enum Handled {
 pub struct Node {
     mesh_prefix: [u8; 2],
     leds: DeviceLeds,
-    zone: Zone,
-    membership: Membership,
+    /// Zones this device belongs to, each already resolved against its LEDs.
+    ///
+    /// Three, and the two halves are the point: `u` runs 0..1 across *the zone
+    /// a source targets*, not across the strip, so the same effect pushed at
+    /// each half draws twice rather than stretching once. That is what makes an
+    /// effect independent of the fixture it lands on, and it had never run
+    /// outside the simulator.
+    ///
+    /// Defined locally here. In the real system a zone is a record that arrives
+    /// over the wire and is resolved on a mapping change - never per frame.
+    zones: [(Zone, Membership); ZONES],
     stack: SourceStack,
     renderer: Renderer,
     /// Broadcast values an effect reads: a slider, a beat, a sensor.
@@ -141,18 +158,31 @@ impl Node {
                 })
                 .collect(),
         };
-        let zone = Zone {
-            id: Uuid([50; 16]),
-            include: vec![Clause::Device { device, leds: None }],
-            exclude: vec![],
-            projection: Projection::Strip,
-        };
-        let membership = zone.resolve(&leds);
+        // The whole strip, then each half. A zone naming a range of LEDs is
+        // the simplest thing that is not the whole device, and it is enough to
+        // show `u` being relative to the zone rather than to the strip.
+        let ranges = [
+            (ZONE_ALL, None),
+            (ZONE_FIRST, Some((0, count / 2))),
+            (ZONE_SECOND, Some((count / 2, count))),
+        ];
+        let zones = ranges.map(|(id, leds_range)| {
+            let zone = Zone {
+                id: Uuid([id; 16]),
+                include: vec![Clause::Device {
+                    device,
+                    leds: leds_range,
+                }],
+                exclude: vec![],
+                projection: Projection::Strip,
+            };
+            let membership = zone.resolve(&leds);
+            (zone, membership)
+        });
         Node {
             mesh_prefix,
             leds,
-            zone,
-            membership,
+            zones,
             // Per-pixel budget this device will spend across all sources, and
             // how many it will admit at once. Generous: a C3 rendering 30 LEDs
             // has far more headroom per pixel than one rendering 300, and the
@@ -196,6 +226,20 @@ impl Node {
     /// Sources admitted, for the same reason.
     pub fn source_count(&self) -> usize {
         self.stack.active().len()
+    }
+
+    /// The zone a source named, falling back to the whole device.
+    ///
+    /// Falling back rather than refusing: a source naming a zone this device
+    /// has never heard of should light something, and the whole strip is the
+    /// least surprising something. A device is never dark because of software.
+    fn zone_for(&self, id: Uuid) -> (&Zone, &Membership) {
+        let found = self
+            .zones
+            .iter()
+            .find(|(zone, _)| zone.id == id)
+            .unwrap_or(&self.zones[0]);
+        (&found.0, &found.1)
     }
 
     /// Remember which slot a source renders from.
@@ -389,7 +433,7 @@ impl Node {
             Payload::SrcPush(push) => {
                 let source = Source {
                     id: push.source_id,
-                    zone: self.zone.id,
+                    zone: push.zone_id,
                     scene: push.scene_id,
                     priority: push.priority,
                     expires_at_us: push.expires_at,
@@ -440,6 +484,25 @@ impl Node {
         let show_us = (self.show_time(now_us) / FRAME_US) * FRAME_US;
         let t = Q16::from_micros(show_us);
 
+        // Fields taken apart so the borrow checker can see they are disjoint:
+        // `bound` holds references into the zones and the program slots while
+        // the renderer and the frame buffer are borrowed mutably, and through
+        // `self` those are one borrow.
+        let Node {
+            leds,
+            zones,
+            stack,
+            renderer,
+            channels,
+            slots,
+            slot_len,
+            source_slot,
+            source_slots_used,
+            frame,
+            output,
+            ..
+        } = self;
+
         // Every admitted source, each with the program it was pushed against.
         //
         // One source was enough to light a strip and could never show what the
@@ -449,21 +512,40 @@ impl Node {
         // program simply never asked it to.
         let mut programs: [Option<Program<'_>>; MAX_SOURCES] = [const { None }; MAX_SOURCES];
         let mut bound: Vec<Bound<'_>> = Vec::new();
-        let active: Vec<Source> = self.stack.active().to_vec();
+        let active: Vec<Source> = stack.active().to_vec();
+        let slot_of = |id: Uuid| -> usize {
+            source_slot[..*source_slots_used]
+                .iter()
+                .find(|(s, _)| *s == id)
+                .map_or(0, |(_, slot)| *slot)
+        };
         for (i, source) in active.iter().enumerate().take(MAX_SOURCES) {
-            let slot = self.slot_of(source.id);
-            if self.slot_len[slot] == 0 {
+            let slot = slot_of(source.id);
+            if slot_len[slot] == 0 {
                 continue;
             }
-            programs[i] = Program::parse(&self.slots[slot][..self.slot_len[slot]]).ok();
+            programs[i] = Program::parse(&slots[slot][..slot_len[slot]]).ok();
         }
         for (i, source) in active.iter().enumerate().take(MAX_SOURCES) {
             if let Some(program) = &programs[i] {
+                // The zone the source named, so `u` is relative to that zone's
+                // LEDs. A source targeting a zone this device is not in
+                // contributes nothing rather than being stretched across
+                // everything - which is how one push reaches a room without
+                // every device having to be told about it separately.
+                let found = zones
+                    .iter()
+                    .find(|(zone, _)| zone.id == source.zone)
+                    .unwrap_or(&zones[0]);
+                let (zone, membership) = (&found.0, &found.1);
+                if membership.is_empty() {
+                    continue;
+                }
                 bound.push(Bound {
                     source: *source,
                     program,
-                    membership: &self.membership,
-                    projection: self.zone.projection,
+                    membership,
+                    projection: zone.projection,
                 });
             }
         }
@@ -476,16 +558,16 @@ impl Node {
         // effect on this device reads the same channels and is a known
         // simplification the moment two of them do not.
         let first = bound[0].program;
-        let mut uniforms = ChannelUniforms::new(&self.channels, first, show_us);
-        let report = self.renderer.render_shard(
+        let mut uniforms = ChannelUniforms::new(channels, first, show_us);
+        let report = renderer.render_shard(
             show_us,
             t,
-            &self.leds,
-            &self.stack,
+            leds,
+            stack,
             &bound,
             &mut uniforms,
-            &mut self.frame,
-            Shard::whole(self.leds.leds.len() as u16),
+            frame,
+            Shard::whole(leds.leds.len() as u16),
         );
 
         // Linear light through the output stage, which is where brightness, the
@@ -493,8 +575,8 @@ impl Node {
         // instead - which is what this did - throws away everything below one
         // code and lets the strip ask the supply for more than it has.
         let mut linear = [Q16::ZERO; MAX_CHANNELS];
-        let n = (self.frame.len() * 3).min(MAX_CHANNELS);
-        for (i, px) in self.frame.iter().enumerate() {
+        let n = (frame.len() * 3).min(MAX_CHANNELS);
+        for (i, px) in frame.iter().enumerate() {
             if i * 3 + 2 >= n {
                 break;
             }
@@ -506,7 +588,7 @@ impl Node {
         // dithers this frame the same way. A local frame counter would work on
         // one device and make two of them disagree at the dark end.
         let phase = (show_us / 33_333) as u32;
-        let encoded = self.output.encode(&linear[..n], phase, out);
+        let encoded = output.encode(&linear[..n], phase, out);
 
         // A fingerprint of what the VM produced, hashed before the output stage
         // so it is the *render* being compared rather than this device's supply
