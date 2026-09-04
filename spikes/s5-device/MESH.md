@@ -131,18 +131,6 @@ knowing precisely rather than claiming either way.
 Two devices with LEDs settle the visible half in a second. One ESP32-S3 is on the
 desk and was not connected when this ran.
 
-The exit criterion is *"two devices, powered on in either order, discover each
-other, elect a timebase, and change colour on the same frame."*
-
-Election, discovery and failover are demonstrated. **"The same frame" is not.**
-Both nodes agree on show time, and `lumen-vm::digest` proves a host and a device
-render identical frames for the same show time — but nothing yet renders the same
-effect on two nodes at once and compares. The desktop peer does not render at
-all.
-
-Two devices with LEDs would settle it by eye in a second. One ESP32-S3 is on the
-desk and was not connected when this ran.
-
 ## Running it
 
 ```bash
