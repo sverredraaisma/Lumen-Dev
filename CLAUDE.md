@@ -151,8 +151,20 @@ is no Rust WiFi for the ESP8266 and no path to one that is not months of work**,
 because its radio blobs come from the NONOS SDK and predate the adapter
 interface `esp-wifi` is built on. The cheaper and better route is to compile the
 portable core - `lumen-vm`, `lumen-proto`, `lumen-hal`, all `no_std` and
-allocator-free - as a static library and let C own the radio. Verified: all
-three build for bare Xtensa today.
+allocator-free - as a static library and let C own the radio. **Built:**
+`lumen-core/nodes/esp8266/` produces `liblumen_esp8266.a`, 23.6 KB of Lumen
+code, eleven C entry points, with `nodes/esp8266/README.md` carrying a worked
+Arduino integration.
+
+## Using the second core
+
+`docs/multicore.md` answers whether to hand tasks to the second core on the
+dual-core chips. The short version: yes, but the win is **not** offloading
+comms - it is splitting the *pixel loop*, which is embarrassingly parallel and
+is the part S2 found short. It belongs in the firmware shell, never in the
+sans-IO core, and `lumen-capi` proves the split renders byte-identically to a
+single core, because a two-core device that rendered differently would break the
+mesh's agreement with itself.
 
 ## Compact instructions
 
